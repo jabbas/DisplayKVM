@@ -1,5 +1,5 @@
 -- One physical monitor shared between nodes: finds it among the attached screens and switches its input.
---   Display.new(id, spec, me, {screens, backend, backendOptions, runner, timer})
+--   Display.new(id, spec, me, {screens, backend, backendOptions, runner, timer, log = optional})
 local Display = {}
 Display.__index = Display
 
@@ -107,6 +107,11 @@ function Display:switchToSync(node, timeoutSec)
     attempt(function(ok)
       if result == nil then result = ok == true end
     end)
+    if result == nil and not self._warnedSync and self._deps.log then
+      self._warnedSync = true
+      self._deps.log.w("backend function returned without calling done; the sleep and request paths need " ..
+        "synchronous completion, so this switch is treated as failed (see the README's backend section)")
+    end
     if result then return true end
     return false, "backend-error"
   end

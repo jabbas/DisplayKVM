@@ -1,10 +1,10 @@
 --- === DisplayKVM ===
 ---
---- Shares one monitor between several Macs without a hardware KVM switch.
+--- Shares one or more monitors between several Macs without a hardware KVM switch.
 ---
 --- Each Mac runs this Spoon. When the user becomes active on a Mac (unlock, wake, start), it
---- switches the shared monitor to its own input over DDC/CI; when the user goes away (lock, sleep,
---- lid closed) it hands the monitor to another active Mac. Nodes find each other with Bonjour (or a
+--- switches the shared monitors to its own input over DDC/CI; when the user goes away (lock, sleep,
+--- lid closed) it hands the monitors to another active Mac. Nodes find each other with Bonjour (or a
 --- static peer list) and exchange HMAC-signed messages over HTTP; no server or cloud is involved.
 ---
 --- Basic usage:
@@ -101,7 +101,11 @@ end
 ---      * pull - Optional. Boolean, default `true`. Whether to pull the display from an active peer on claim
 ---    * node - Optional. This node's name. Defaults to `hs.host.localizedName()`; must appear in some `inputs`
 ---    * backend - Optional. `"m1ddc"` (default), `"ddcctl"`, `"betterdisplay"`, `"lunar"` or a
----      `function(display, input, done)` that calls `done(true)` or `done(false)`
+---      `function(display, input, done)` that calls `done(true)` or `done(false)`. A function backend
+---      **must call `done` before it returns**: handing a request from a peer and going to sleep switch
+---      synchronously, and a `done` that has not been called by then counts as a failure. Only the
+---      asynchronous claim path tolerates a later `done`. Do the work synchronously (for example with
+---      `hs.execute`) or use a built-in backend
 ---    * backendOptions - Optional. A table, e.g. `{ path = "/path/to/binary" }`
 ---    * peers - Optional. A list of static `"host:port"` peers, for networks without Bonjour
 ---    * port - Optional. TCP port of the HTTP server. Default `8765`
@@ -220,6 +224,7 @@ local function buildNode(self, cfg)
       backendOptions = cfg.backendOptions,
       runner = runner,
       timer = hs.timer,
+      log = log,
     })
   end
 

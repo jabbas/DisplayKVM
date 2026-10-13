@@ -6,7 +6,7 @@ local UUID_A = "37D8832A-2D66-02CA-B9F7-8F30A301B230"
 local UUID_B = "1B2C3D4E-0000-1111-2222-333344445555"
 
 describe("Display", function()
-  local timer, task, runner, screens, backend, opts, results
+  local timer, task, runner, screens, backend, opts, results, logger
 
   -- Fake tasks complete on the next timer tick (latency 0) unless a latency is given.
   local function build(spec, script, latency)
@@ -24,6 +24,7 @@ describe("Display", function()
       backendOptions = opts,
       runner = runner,
       timer = timer,
+      log = logger,
     })
   end
 
@@ -36,6 +37,7 @@ describe("Display", function()
     screens = { { uuid = UUID_A, name = "DELL U2720Q (2)" }, { uuid = UUID_B, name = "LG-27" } }
     backend = dofile("backends/m1ddc.lua")
     opts = {}
+    logger = nil
   end)
 
   local function spec(match)
@@ -275,6 +277,26 @@ describe("Display", function()
       assert.is_false(ok)
       assert.equals("backend-error", reason)
       late(true)
+    end)
+
+    it("warns once when a backend function returns without having called done", function()
+      local warnings = {}
+      logger = { w = function(msg) warnings[#warnings + 1] = msg end }
+      backend = function() end
+      local d = build(spec(UUID_B))
+      d:switchToSync("laptop", 3)
+      d:switchToSync("laptop", 3)
+      assert.equals(1, #warnings)
+      assert.matches("done", warnings[1])
+      assert.matches("synchronous", warnings[1])
+    end)
+
+    it("does not warn when the backend function calls done before returning", function()
+      local warnings = {}
+      logger = { w = function(msg) warnings[#warnings + 1] = msg end }
+      backend = function(_, _, done) done(true) end
+      build(spec(UUID_B)):switchToSync("laptop", 3)
+      assert.same({}, warnings)
     end)
 
     it("fails with a backend function that reports failure", function()

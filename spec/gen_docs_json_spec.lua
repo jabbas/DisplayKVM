@@ -15,7 +15,7 @@ describe("gen-docs-json", function()
     assert.equals("DisplayKVM", docs[1].name)
     assert.equals("0.1.0", docs[1].version)
     assert.equals("https://github.com/jabbas/DisplayKVM", docs[1].homepage)
-    assert.truthy(docs[1].desc:find("Shares one monitor between several Macs", 1, true))
+    assert.truthy(docs[1].desc:find("Shares one or more monitors between several Macs", 1, true))
     assert.is_nil(docs[1].desc:find("Basic usage", 1, true))
   end)
 
