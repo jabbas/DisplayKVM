@@ -233,5 +233,15 @@ describe("Discovery", function()
       d:alias("laptop", "192.0.2.99:1")
       assert.is_nil(d:resolve("laptop"))
     end)
+
+    it("lists the addresses that have no alias to an alive node", function()
+      local alive = { laptop = true }
+      local isAlive = function(name) return alive[name] == true end
+      assert.are.same({ "192.0.2.5:8765", "192.0.2.6:9000" }, d:unaliased(isAlive))
+      d:alias("laptop", "192.0.2.5:8765")
+      assert.are.same({ "192.0.2.6:9000" }, d:unaliased(isAlive))
+      alive.laptop = false
+      assert.are.same({ "192.0.2.5:8765", "192.0.2.6:9000" }, d:unaliased(isAlive))
+    end)
   end)
 end)

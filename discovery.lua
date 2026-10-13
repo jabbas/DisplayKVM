@@ -152,4 +152,18 @@ function Discovery:alias(nodeName, addressName)
   if self.static[addressName] ~= nil then self.aliases[nodeName] = addressName end
 end
 
+-- Static addresses with no learned alias to a node for which `isAlive(node)` holds. The node name
+-- behind an address is only learned from a signed 200 reply, so these still need a `hello`.
+function Discovery:unaliased(isAlive)
+  local out = {}
+  for _, address in ipairs(self.staticOrder) do
+    local learned = false
+    for node, aliased in pairs(self.aliases) do
+      if aliased == address and isAlive(node) then learned = true end
+    end
+    if not learned then out[#out + 1] = address end
+  end
+  return out
+end
+
 return Discovery

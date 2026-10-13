@@ -18,8 +18,10 @@ local function make(o)
     partitionMode = o.partitionMode,
     monitor = { inputs = inputs, mode = o.mode, acceptsInactive = o.acceptsInactive, input = o.input },
   })
-  sim:start()
-  sim:advance(1)
+  if not o.delayed then
+    sim:start()
+    sim:advance(1)
+  end
   return sim
 end
 
@@ -424,6 +426,53 @@ describe("Node sleep broadcast with static peers", function()
     assert.equal(1, #sim:sent({ from = "laptop", to = "desk-mini", sync = true }))
     assert.equal("desk-mini", sim:owner("desk-mini"))
     assert.is_false(sim:presence("desk-mini", "laptop").active)
+  end)
+
+  describe("S10c the peer that starts later (static peers only)", function()
+    local STATIC = { ["desk-mini"] = "192.0.2.1:8765", laptop = "192.0.2.2:8765" }
+
+    -- laptop is up first; desk-mini starts afterwards. Real Discovery never announces a late
+    -- static peer to a node that is already running.
+    local function reverseStart()
+      local sim = make({ static = STATIC, delayed = true })
+      sim:start("laptop")
+      sim:advance(1)
+      sim:start("desk-mini")
+      sim:advance(1)
+      return sim
+    end
+
+    it("lets the node that started first request the display from the late peer", function()
+      local sim = reverseStart()
+      assert.is_true(sim:node("laptop"):alive("desk-mini"))
+      sim:activate("laptop")
+      sim:advance(1)
+      assert.equal(16, sim:input())
+      assert.equal("laptop", sim:owner("laptop"))
+    end)
+
+    it("lets the node that started first sleep-broadcast to the late peer", function()
+      local sim = reverseStart()
+      sim:activate("laptop")
+      sim:advance(1)
+      sim:sleep("laptop")
+      assert.equal(1, #sim:sent({ from = "laptop", to = "desk-mini", sync = true }))
+      assert.equal("desk-mini", sim:owner("desk-mini"))
+      assert.is_false(sim:presence("desk-mini", "laptop").active)
+    end)
+
+    it("re-sends hello on the heartbeat until the alias is learned", function()
+      local sim = reverseStart()
+      sim.entries.laptop.aliases = {} -- as if the first hello round trip had been lost
+      local before = #sim:sent({ from = "laptop", type = "hello" })
+      sim:advance(30)
+      assert.equal(before + 1, #sim:sent({ from = "laptop", type = "hello" }))
+      assert.equal(STATIC["desk-mini"], sim.entries.laptop.aliases["desk-mini"])
+      local states = #sim:sent({ from = "laptop", type = "state" })
+      sim:advance(30)
+      assert.equal(before + 1, #sim:sent({ from = "laptop", type = "hello" }))
+      assert.is_true(#sim:sent({ from = "laptop", type = "state" }) > states)
+    end)
   end)
 end)
 

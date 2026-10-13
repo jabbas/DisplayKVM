@@ -16,7 +16,8 @@
 --              :switchToSync(node, timeoutSec) -> ok, reason
 --   transport  Transport: :start(onMessage, onSeen) :stop() :send(peer, type, body, cb(ok, reply, status))
 --              :sendSync(peer, type, body, timeoutSec) -> ok
---   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names()
+--   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names() :resolve(name)
+--              :unaliased(isAlive) -> static addresses whose node name is not learned yet
 --   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
 --   lid        optional LidSensor: :start(onChange(closed)) :stop() :closed(); used only if cfg.activity.lid
 --   now        function() -> integer milliseconds (also the clock for State timestamps)
@@ -35,6 +36,7 @@ local SLEEP_SWITCH_TIMEOUT = 2
 local SLEEP_SEND_TIMEOUT = 1
 local NOTIFY_INTERVAL_MS = 300000
 local ALIVE_INTERVALS = 3
+local UNALIASED_HELLO_INTERVAL_MS = 5000
 
 local WIRE_REASONS = {
   ["not-visible"] = "not-visible",
@@ -123,6 +125,37 @@ function Node:_broadcast()
     self.transport:send(name, "state", body, function(ok, _, status)
       if not ok then self.log.d("state to " .. tostring(name) .. " failed: " .. tostring(status)) end
     end)
+  end
+end
+
+-- Static peers are only known by address. The node name behind an address is learned from the signed
+-- reply to a `hello` (a `state` is answered with a bare 204), and Discovery announces a static peer
+-- once, at start. So a node that started before its static peer would never be able to route to it.
+-- Hence: the heartbeat sends `hello` instead of `state` to every static address without a learned
+-- alias, and so does an inbound message from a node that cannot be routed yet (rate limited).
+function Node:_helloUnaliased()
+  local now = self.now()
+  if self.lastUnaliasedHello ~= nil and now - self.lastUnaliasedHello < UNALIASED_HELLO_INTERVAL_MS then return end
+  self.lastUnaliasedHello = now
+  for _, address in ipairs(self.discovery:unaliased(function(name) return self:alive(name) end)) do
+    self:_sendHello(address)
+  end
+end
+
+function Node:_heartbeat()
+  local body = self:_stateBody()
+  local hello = {}
+  for _, address in ipairs(self.discovery:unaliased(function(name) return self:alive(name) end)) do
+    hello[address] = true
+  end
+  for _, name in ipairs(self.discovery:names()) do
+    if hello[name] then
+      self:_sendHello(name)
+    else
+      self.transport:send(name, "state", body, function(ok, _, status)
+        if not ok then self.log.d("state to " .. tostring(name) .. " failed: " .. tostring(status)) end
+      end)
+    end
   end
 end
 
@@ -451,6 +484,8 @@ function Node:onMessage(msg)
     self:_notify("duplicate-node", "another process is using the node name '" .. tostring(from) .. "'")
   end
 
+  if self.discovery:resolve(from) == nil then self:_helloUnaliased() end
+
   local body = type(msg.body) == "table" and msg.body or {}
   if msg.type == "hello" then
     self.state:merge(body.state)
@@ -489,7 +524,7 @@ function Node:start()
     self.log.d("peer " .. tostring(name) .. " went away")
   end)
   self.activity:start(function(isActive, why, sync) self:_onActivity(isActive, why, sync) end)
-  self.heartbeat = self.timer.doEvery(self.cfg.heartbeat, function() self:_broadcast() end)
+  self.heartbeat = self.timer.doEvery(self.cfg.heartbeat, function() self:_heartbeat() end)
 
   if active then self:_onActive("start") end
 end

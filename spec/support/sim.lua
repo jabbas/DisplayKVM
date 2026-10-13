@@ -16,7 +16,9 @@
 --                 A reply lost to a partition always fails with "timeout" after the soft timeout.
 --   mute         {name = true}: that node's Discovery reports no peers, so it never initiates contact
 --   static       {node = "host:port"}: every other node reaches that node only by the address (as with
---                 static peers and no mDNS) until a reply teaches the alias, like the real Transport
+--                 static peers and no mDNS) until a reply teaches the alias, like the real Transport.
+--                 Like the real Discovery, a static address is announced (onUp) only when the node
+--                 itself starts, never when the peer behind it starts later.
 --   lid          true enables the lid sensor in the node config
 --
 -- DDC: sim.ddcLatency (seconds, default 0.1) is how long an async switchTo takes; sim.ddcApply = "end"
@@ -116,18 +118,22 @@ local function newDisplay(sim, node, id, spec)
   return d
 end
 
-local function newTransport(sim, entry)
-  local name = entry.name
-  local counts = sim.counts[name]
-  local t = {}
-
-  -- Peers configured by address are only known by their address until a reply teaches the alias.
-  local function resolve(peer)
+-- Peers configured by address are only known by their address until a reply teaches the alias.
+local function newResolver(sim, entry)
+  return function(peer)
     local byAddress = sim.addressOwner[peer]
     if byAddress then return sim.routes[byAddress] end
     if sim.static[peer] and entry.aliases[peer] == nil then return nil end
     return sim.routes[peer]
   end
+end
+
+local function newTransport(sim, entry)
+  local name = entry.name
+  local counts = sim.counts[name]
+  local t = {}
+
+  local resolve = entry.resolve
 
   local function reachable(target)
     return target ~= nil and target.listening and not sim.partitioned[name] and not sim.partitioned[target.name]
@@ -201,21 +207,48 @@ local function newDiscovery(sim, entry)
   function d:names()
     local out = {}
     if sim.mute[entry.name] then return out end
-    for name, other in pairs(sim.routes) do
-      if name ~= entry.name and other.listening then out[#out + 1] = sim.static[name] or name end
+    for _, name in ipairs(sim.names) do
+      local other = sim.routes[name]
+      if name ~= entry.name then
+        -- Static addresses are always listed, up or not; Bonjour peers only while they are running.
+        if sim.static[name] then
+          out[#out + 1] = sim.static[name]
+        elseif other and other.listening then
+          out[#out + 1] = name
+        end
+      end
     end
     table.sort(out)
     return out
   end
 
+  -- Like the real Discovery: Bonjour peers that are already running are found, every static
+  -- address is announced once, whether or not anything listens there yet.
   function d:start(onUp, _)
     entry.onUp, entry.discoveryStarted = onUp, true
-    for _, name in ipairs(self:names()) do onUp(name) end
+    for _, name in ipairs(self:names()) do
+      if sim.addressOwner[name] or sim.routes[name] then onUp(name) end
+    end
   end
 
   function d:stop() entry.discoveryStarted = false end
-  function d:resolve(name) return sim.routes[name] and { host = name, port = 0 } or nil end
+  function d:resolve(name) return entry.resolve(name) and { host = name, port = 0 } or nil end
   function d:alias(node, address) entry.aliases[node] = address end
+
+  -- Static addresses with no alias leading to a node that is alive.
+  function d:unaliased(isAlive)
+    local out = {}
+    for _, address in ipairs(self:names()) do
+      if sim.addressOwner[address] then
+        local learned = false
+        for node, aliased in pairs(entry.aliases) do
+          if aliased == address and isAlive(node) then learned = true end
+        end
+        if not learned then out[#out + 1] = address end
+      end
+    end
+    return out
+  end
 
   return d
 end
@@ -243,6 +276,7 @@ function Sim:_build(name)
     displays = { [self.displayId] = displaySpec },
   }
 
+  entry.resolve = newResolver(self, entry)
   entry.transport = newTransport(self, entry)
   entry.discovery = newDiscovery(self, entry)
 
@@ -326,8 +360,9 @@ function Sim:_startEntry(entry)
   self.routes[entry.name] = entry
   entry.node:start()
   for _, other in pairs(self.routes) do
-    if other ~= entry and other.discoveryStarted and not self.mute[other.name] then
-      other.onUp(self.static[entry.name] or entry.name)
+    -- Only Bonjour announces a node that starts later; a static address is greeted at start only.
+    if other ~= entry and other.discoveryStarted and not self.mute[other.name] and not self.static[entry.name] then
+      other.onUp(entry.name)
     end
   end
 end
