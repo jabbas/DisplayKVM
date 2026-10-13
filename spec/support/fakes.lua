@@ -36,6 +36,40 @@
 --   screenWatcher.new(fn) -> {start, stop}
 --   screenWatcher.fire()              -- calls the callback of every started watcher
 --   screenWatcher.watchers            -- all created watchers: {started, stopped}
+--
+-- fakes.httpserver()                  -- mirrors hs.httpserver
+--   httpserver.new(ssl, bonjour) -> {setPort(n), setInterface(s), setCallback(fn), start(), stop()}
+--           (colon methods, like the real object)
+--           (setters return the server); fields: ssl, bonjour, port, interface, callback, started, stopped
+--   server.request(method, path, headers, body) -> body, status, headers
+--           calls the callback like the real server does; errors if no callback is set
+--   httpserver.created                -- every server created
+--
+-- fakes.http()                        -- mirrors hs.http
+--   http.asyncPost(url, data, headers, cb) -- records {url, data, headers, cb, delivered}; never
+--           answers on its own, the test delivers explicitly
+--   http.deliver(status, body, headers) -- calls the callback of the latest post; http.deliverTo(n, ...)
+--           does the same for post n. Either may be called repeatedly to simulate a late or
+--           duplicate callback
+--   http.posts                        -- every asyncPost call
+--   http.doRequest(url, method, data, headers) -> status, body, headers
+--           records {url, method, data, headers} in http.requests and delegates to http.sync(call)
+--           (default returns 204, "", {}); a test overrides http.sync, e.g. to raise an error
+--   http.requests                     -- every doRequest call
+--
+-- fakes.bonjour()                     -- mirrors hs.bonjour
+--   bonjour.new() -> browser {findServices(type, domain, cb), stop()}; the callback receives
+--           (browser, "local.", isAdded, service, moreComing); fields: serviceType, domain, stopped
+--   browser.add(svc) / browser.remove(svc) -- fire the callback with isAdded true / false
+--   bonjour.browsers                  -- every browser created
+--   bonjour.service.new(name, type, port) -> published service {txtRecord(tbl), publish(), stop()};
+--           fields: name, serviceType, port, txt, published, stopped
+--   bonjour.published                 -- every service created through service.new
+--   bonjour.remote({name, host, port, txt, result, err}) -> remote service object with
+--           :name(), :hostname(), :port(), :txtRecord(), :resolve(timeout, cb)
+--           resolve records svc.timeout and svc.resolveCb; if `result` is "resolved", "error" (with
+--           `err` as message) or "stop" the callback is invoked at once, otherwise the test calls
+--           svc.complete(result, msg) later
 
 local fakes = {}
 
@@ -208,6 +242,89 @@ end
 function fakes.screenWatcher()
   local factory = watcherFactory(function(w) w.fn() end)
   return { new = factory.new, watchers = factory.watchers, fire = function() factory.each() end }
+end
+
+function fakes.httpserver()
+  local httpserver = { created = {} }
+  function httpserver.new(ssl, bonjour)
+    local server = { ssl = ssl, bonjour = bonjour, started = false, stopped = false }
+    function server.setPort(_, n) server.port = n return server end
+    function server.setInterface(_, s) server.interface = s return server end
+    function server.setCallback(_, fn) server.callback = fn return server end
+    function server.start() server.started = true server.stopped = false return server end
+    function server.stop() server.started = false server.stopped = true return server end
+    function server.request(method, path, headers, body)
+      assert(server.callback, "fakes.httpserver: no callback set")
+      return server.callback(method, path, headers or {}, body or "")
+    end
+    httpserver.created[#httpserver.created + 1] = server
+    return server
+  end
+  return httpserver
+end
+
+function fakes.http()
+  local http = { posts = {}, requests = {} }
+  function http.asyncPost(url, data, headers, cb)
+    http.posts[#http.posts + 1] = { url = url, data = data, headers = headers, cb = cb }
+  end
+  function http.deliverTo(n, status, body, headers)
+    local post = assert(http.posts[n], "fakes.http: no such post")
+    post.delivered = true
+    post.cb(status, body, headers or {})
+  end
+  function http.deliver(status, body, headers) http.deliverTo(#http.posts, status, body, headers) end
+  function http.sync() return 204, "", {} end
+  function http.doRequest(url, method, data, headers)
+    local call = { url = url, method = method, data = data, headers = headers }
+    http.requests[#http.requests + 1] = call
+    return http.sync(call)
+  end
+  return http
+end
+
+function fakes.bonjour()
+  local bonjour = { browsers = {}, published = {}, service = {} }
+
+  function bonjour.new()
+    local browser = { stopped = false }
+    function browser.findServices(_, serviceType, domain, cb)
+      browser.serviceType, browser.domain, browser.cb = serviceType, domain, cb
+      return browser
+    end
+    function browser.stop() browser.stopped = true return browser end
+    function browser.add(svc) browser.cb(browser, "local.", true, svc, false) end
+    function browser.remove(svc) browser.cb(browser, "local.", false, svc, false) end
+    bonjour.browsers[#bonjour.browsers + 1] = browser
+    return browser
+  end
+
+  function bonjour.service.new(name, serviceType, port)
+    local svc = { name = name, serviceType = serviceType, port = port, published = false, stopped = false }
+    function svc.txtRecord(_, tbl) svc.txt = tbl return svc end
+    function svc.publish() svc.published = true return svc end
+    function svc.stop() svc.published = false svc.stopped = true return svc end
+    bonjour.published[#bonjour.published + 1] = svc
+    return svc
+  end
+
+  function bonjour.remote(spec)
+    local svc = {}
+    function svc.name() return spec.name end
+    function svc.hostname() return spec.host end
+    function svc.port() return spec.port end
+    function svc.txtRecord() return spec.txt end
+    function svc.complete(result, msg) svc.resolveCb(svc, result, msg) end
+    function svc.resolve(_, timeout, cb)
+      svc.timeout, svc.resolveCb = timeout, cb
+      if spec.result == "error" then cb(svc, "error", spec.err or "timeout")
+      elseif spec.result then cb(svc, spec.result) end
+      return svc
+    end
+    return svc
+  end
+
+  return bonjour
 end
 
 return fakes
