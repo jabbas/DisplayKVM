@@ -1,0 +1,221 @@
+local json = require("dkjson")
+local Message = dofile("message.lua")
+
+describe("Message", function()
+  local clock, counter, desk, laptop
+
+  local function hmac(k, d) return "H" .. #k .. ":" .. d end
+
+  local function make(node, instance)
+    return Message.new({
+      secret = "shared-secret",
+      node = node,
+      instance = instance,
+      hmac = hmac,
+      now = function() return clock end,
+      random = function(n)
+        counter = counter + 1
+        return string.format("%0" .. (n * 2) .. "x", counter)
+      end,
+      codec = { encode = json.encode, decode = json.decode },
+      window = 30000,
+      nonceTtl = 60000,
+    })
+  end
+
+  before_each(function()
+    clock = 1000000
+    counter = 0
+    desk = make("desk-mini", "inst-desk")
+    laptop = make("laptop", "inst-laptop")
+  end)
+
+  describe("build", function()
+    it("produces the envelope and signs the raw string", function()
+      local raw, sig = desk:build("state", { x = 1 })
+      assert.are.equal(hmac("shared-secret", raw), sig)
+      local env = json.decode(raw)
+      assert.are.equal(1, env.v)
+      assert.are.equal("desk-mini", env.from)
+      assert.are.equal("inst-desk", env.instance)
+      assert.are.equal(clock, env.ts)
+      assert.are.equal(32, #env.nonce)
+      assert.are.equal("state", env.type)
+      assert.are.same({ x = 1 }, env.body)
+    end)
+
+    it("uses a fresh nonce each time", function()
+      local a = json.decode((desk:build("state", {})))
+      local b = json.decode((desk:build("state", {})))
+      assert.are_not.equal(a.nonce, b.nonce)
+    end)
+  end)
+
+  describe("verify", function()
+    it("accepts a message from a peer", function()
+      local msg, reason = laptop:verify(desk:build("state", { x = 1 }))
+      assert.is_nil(reason)
+      assert.are.equal("state", msg.type)
+      assert.are.equal("desk-mini", msg.from)
+      assert.are.equal("inst-desk", msg.instance)
+      assert.are.equal(1, msg.body.x)
+    end)
+
+    it("rejects a tampered raw body", function()
+      local raw, sig = desk:build("state", { x = 1 })
+      local i = raw:find("1}", 1, true)
+      local tampered = raw:sub(1, i - 1) .. "2" .. raw:sub(i + 1)
+      local msg, reason = laptop:verify(tampered, sig)
+      assert.is_nil(msg)
+      assert.are.equal("bad-signature", reason)
+    end)
+
+    it("rejects a missing signature", function()
+      local raw = desk:build("state", {})
+      local msg, reason = laptop:verify(raw, nil)
+      assert.is_nil(msg)
+      assert.are.equal("bad-signature", reason)
+    end)
+
+    it("rejects a signature made with another secret", function()
+      local other = Message.new({
+        secret = "other", node = "desk-mini", instance = "i", hmac = hmac,
+        now = function() return clock end, random = function() return string.rep("0", 32) end,
+        codec = { encode = json.encode, decode = json.decode },
+      })
+      local msg, reason = laptop:verify(other:build("state", {}))
+      assert.is_nil(msg)
+      assert.are.equal("bad-signature", reason)
+    end)
+
+    it("accepts a timestamp exactly at the window edge", function()
+      local raw, sig = desk:build("state", {})
+      clock = clock + 30000
+      assert.is_table((laptop:verify(raw, sig)))
+    end)
+
+    it("rejects a stale message and reports the sender", function()
+      local raw, sig = desk:build("state", {})
+      clock = clock + 30001
+      local msg, reason, from = laptop:verify(raw, sig)
+      assert.is_nil(msg)
+      assert.are.equal("stale", reason)
+      assert.are.equal("desk-mini", from)
+    end)
+
+    it("rejects a message from the future beyond the window", function()
+      local raw, sig = desk:build("state", {})
+      clock = clock - 30001
+      local msg, reason, from = laptop:verify(raw, sig)
+      assert.is_nil(msg)
+      assert.are.equal("stale", reason)
+      assert.are.equal("desk-mini", from)
+    end)
+
+    it("rejects a replay", function()
+      local raw, sig = desk:build("state", {})
+      assert.is_table((laptop:verify(raw, sig)))
+      local msg, reason = laptop:verify(raw, sig)
+      assert.is_nil(msg)
+      assert.are.equal("replay", reason)
+    end)
+
+    it("forgets nonces after the TTL", function()
+      assert.is_table((laptop:verify(desk:build("state", {}))))
+      assert.are.equal(1, laptop:_nonceCount())
+      clock = clock + 60000
+      assert.is_table((laptop:verify(desk:build("state", {}))))
+      assert.are.equal(2, laptop:_nonceCount())
+      clock = clock + 1
+      assert.is_table((laptop:verify(desk:build("state", {}))))
+      assert.are.equal(2, laptop:_nonceCount())
+      clock = clock + 60001
+      assert.is_table((laptop:verify(desk:build("state", {}))))
+      assert.are.equal(1, laptop:_nonceCount())
+    end)
+
+    it("does not remember nonces of rejected messages", function()
+      local raw, sig = desk:build("state", {})
+      laptop:verify(raw .. "x", sig)
+      assert.are.equal(0, laptop:_nonceCount())
+    end)
+
+    it("rejects its own messages", function()
+      local msg, reason = desk:verify(desk:build("state", {}))
+      assert.is_nil(msg)
+      assert.are.equal("self", reason)
+    end)
+
+    it("rejects a correctly signed non-JSON payload as malformed", function()
+      local raw = "not json"
+      local msg, reason = laptop:verify(raw, hmac("shared-secret", raw))
+      assert.is_nil(msg)
+      assert.are.equal("malformed", reason)
+    end)
+
+    it("rejects malformed envelopes", function()
+      local good = {
+        v = 1, from = "desk-mini", instance = "i", ts = clock, nonce = "n", type = "state", body = {},
+      }
+      local cases = {
+        function(e) e.v = 2 end,
+        function(e) e.v = nil end,
+        function(e) e.from = 5 end,
+        function(e) e.instance = nil end,
+        function(e) e.ts = "now" end,
+        function(e) e.nonce = nil end,
+        function(e) e.type = 1 end,
+        function(e) e.body = "text" end,
+        function(e) e.body = nil end,
+      }
+      for i, mut in ipairs(cases) do
+        local e = {}
+        for k, v in pairs(good) do e[k] = v end
+        mut(e)
+        local raw = json.encode(e)
+        local msg, reason = laptop:verify(raw, hmac("shared-secret", raw))
+        assert.is_nil(msg, "case " .. i)
+        assert.are.equal("malformed", reason, "case " .. i)
+      end
+    end)
+
+    it("rejects JSON that is not an object", function()
+      local raw = "42"
+      local msg, reason = laptop:verify(raw, hmac("shared-secret", raw))
+      assert.is_nil(msg)
+      assert.are.equal("malformed", reason)
+    end)
+
+    it("does not raise when the codec raises", function()
+      local m = Message.new({
+        secret = "s", node = "a", instance = "i", hmac = hmac,
+        now = function() return clock end, random = function() return "0" end,
+        codec = { encode = json.encode, decode = function() error("boom") end },
+      })
+      local msg, reason = m:verify("x", hmac("s", "x"))
+      assert.is_nil(msg)
+      assert.are.equal("malformed", reason)
+    end)
+
+    it("treats non-string raw as bad-signature", function()
+      local msg, reason = laptop:verify(nil, "sig")
+      assert.is_nil(msg)
+      assert.are.equal("bad-signature", reason)
+    end)
+  end)
+
+  describe("constantTimeEqual", function()
+    it("compares strings", function()
+      assert.is_true(Message.constantTimeEqual("abc", "abc"))
+      assert.is_false(Message.constantTimeEqual("abc", "abd"))
+      assert.is_false(Message.constantTimeEqual("abc", "ab"))
+      assert.is_false(Message.constantTimeEqual("ab", "abc"))
+      assert.is_true(Message.constantTimeEqual("", ""))
+    end)
+
+    it("returns false for non-strings", function()
+      assert.is_false(Message.constantTimeEqual(nil, "a"))
+      assert.is_false(Message.constantTimeEqual("a", nil))
+    end)
+  end)
+end)
