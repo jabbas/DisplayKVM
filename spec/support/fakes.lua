@@ -41,6 +41,8 @@
 --   httpserver.new(ssl, bonjour) -> {setPort(n), setInterface(s), setCallback(fn), start(), stop()}
 --           (colon methods, like the real object)
 --           (setters return the server); fields: ssl, bonjour, port, interface, callback, started, stopped
+--   server:maxBodySize([n]), server:getPort() (0 unless listening); like Hammerspoon, start() never raises:
+--           set httpserver.failStart = true to make servers fail to listen
 --   server.request(method, path, headers, body) -> body, status, headers
 --           calls the callback like the real server does; errors if no callback is set
 --   httpserver.created                -- every server created
@@ -253,7 +255,19 @@ function fakes.httpserver()
     function server.setPort(_, n) server.port = n return server end
     function server.setInterface(_, s) server.interface = s return server end
     function server.setCallback(_, fn) server.callback = fn return server end
-    function server.start() server.started = true server.stopped = false return server end
+    -- Like Hammerspoon, start() never raises and always returns the server; a failure to listen
+    -- (httpserver.failStart = true) is only visible as getPort() == 0.
+    function server.start()
+      server.started = not httpserver.failStart
+      server.stopped = false
+      return server
+    end
+    function server.getPort() return server.started and server.port or 0 end
+    function server.maxBodySize(_, n)
+      if n == nil then return server.maxBody or 10485760 end
+      server.maxBody = n
+      return server
+    end
     function server.stop() server.started = false server.stopped = true return server end
     function server.request(method, path, headers, body)
       assert(server.callback, "fakes.httpserver: no callback set")

@@ -175,10 +175,10 @@ describe("init", function()
   end)
 
   describe("start with a valid configuration", function()
-    local hs, obj
+    local hs, calls, obj
 
     before_each(function()
-      hs = fake_hs.install({ full = true })
+      hs, calls = fake_hs.install({ full = true })
       obj = dofile("init.lua")
       obj:configure(validConfig())
     end)
@@ -207,6 +207,25 @@ describe("init", function()
       assert.is_truthy(status.instance:match("^%x+$"))
       assert.is_not_nil(status.displays.main)
       assert.is_false(status.displays.main.visible)
+    end)
+
+    it("reports a port that cannot be listened on and keeps no half-started node", function()
+      hs.httpserver.failStart = true
+      assert.are.equal(obj, obj:start())
+      assert.is_nil(obj._node)
+      assert.is_nil(obj:status())
+      assert.are.equal(0, #hs.bonjour.published)
+      assert.is_nil(hs.caffeinate.watchers[1])
+      local texts = {}
+      for _, c in ipairs(calls) do
+        if c.name == "notify.new" then texts[#texts + 1] = c.args[1].informativeText end
+      end
+      assert.are.same({ "DisplayKVM: cannot listen on port 8765" }, texts)
+      assert.are.equal(1, count(calls, "log.e"))
+
+      hs.httpserver.failStart = false
+      obj:start()
+      assert.is_not_nil(obj:status())
     end)
 
     it("signs messages with the instance reported by status()", function()

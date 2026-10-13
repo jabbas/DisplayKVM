@@ -7,6 +7,7 @@ Transport.__index = Transport
 local PATH = "/v1/msg"
 local SIG_HEADER = "X-DisplayKVM-Sig"
 local LOG_INTERVAL_MS = 60000
+local MAX_BODY_SIZE = 65536
 local noop = function() end
 
 local function header(headers, name)
@@ -71,17 +72,30 @@ function Transport:_handle(method, path, headers, body)
   return raw, status, { ["Content-Type"] = "application/json", [SIG_HEADER] = sig }
 end
 
+-- Returns true, or false and a reason when the server cannot listen. hs.httpserver:start() never
+-- raises: it logs the failure itself and returns the server, so success is checked with getPort(),
+-- which is 0 unless the server is actually listening. Nothing is left running on failure.
 function Transport:start(onMessage, onSeen)
   self.onMessage = onMessage
   self.onSeen = onSeen or noop
   local server = self.httpserver.new(false, false)
   server:setPort(self.port)
   if self.interface ~= nil then server:setInterface(self.interface) end
+  if server.maxBodySize then server:maxBodySize(MAX_BODY_SIZE) end
   server:setCallback(function(method, path, headers, body)
     return self:_handle(method, path, headers, body)
   end)
-  server:start()
+
+  local started, startErr = pcall(server.start, server)
+  local listening = started and (server.getPort and server:getPort() or 1) or 0
+  if listening == 0 then
+    local reason = "cannot listen on port " .. tostring(self.port)
+    self.log.e(reason .. (started and "" or ": " .. tostring(startErr)))
+    pcall(server.stop, server)
+    return false, reason
+  end
   self.server = server
+  return true
 end
 
 function Transport:stop()

@@ -98,6 +98,46 @@ describe("Transport", function()
       assert.is_true(server.stopped)
     end)
 
+    it("limits the request body to 64 KiB", function()
+      assert.are.equal(65536, server:maxBodySize())
+    end)
+
+    it("reports success from start()", function()
+      t:stop()
+      t = Transport.new({
+        httpserver = fakes.httpserver(), http = http, timer = timer, message = desk, discovery = discovery,
+        port = 8765, log = logs, now = function() return clock end,
+      })
+      assert.is_true(t:start(function() end))
+    end)
+
+    describe("when the server cannot listen", function()
+      local httpserver, ok, err
+
+      before_each(function()
+        t:stop()
+        httpserver = fakes.httpserver()
+        httpserver.failStart = true
+        logs = makeLog()
+        t = Transport.new({
+          httpserver = httpserver, http = http, timer = timer, message = desk, discovery = discovery,
+          port = 8765, log = logs, now = function() return clock end,
+        })
+        ok, err = t:start(function() end)
+      end)
+
+      it("returns false with a reason naming the port", function()
+        assert.is_false(ok)
+        assert.matches("port 8765", err)
+      end)
+
+      it("logs an error and releases the server", function()
+        assert.are.equal(1, logs.count("e", "8765"))
+        assert.is_true(httpserver.created[1].stopped)
+        assert.is_nil(t.server)
+      end)
+    end)
+
     it("answers 404 to a non-POST request", function()
       local body, status = server.request("GET", "/v1/msg", {}, "")
       assert.are.equal(404, status)

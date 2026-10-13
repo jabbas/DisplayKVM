@@ -138,6 +138,11 @@ function Config.validate(raw, env)
   if type(raw.displays) ~= "table" or next(raw.displays) == nil then
     return fail("displays is required and must not be empty")
   end
+  for id in pairs(raw.displays) do
+    if type(id) ~= "string" or id == "" then
+      return fail("displays must be a table keyed by non-empty display id strings (got key %s)", tostring(id))
+    end
+  end
   local displays = {}
   for _, id in ipairs(sortedKeys(raw.displays)) do
     local d, err = normaliseDisplay(id, raw.displays[id])

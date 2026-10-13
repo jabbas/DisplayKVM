@@ -276,8 +276,14 @@ function obj:start()
     return self
   end
   if self._node ~= nil then self:stop() end
-  self._node = buildNode(self, self._cfg)
-  self._node:start()
+  local node = buildNode(self, self._cfg)
+  local started, why = node:start()
+  if not started then
+    -- Transport has already logged the cause.
+    hs.notify.new({ title = "DisplayKVM", informativeText = "DisplayKVM: " .. tostring(why) }):send()
+    return self
+  end
+  self._node = node
   return self
 end
 
@@ -344,8 +350,12 @@ end
 ---
 --- Returns:
 ---  * `nil` when not running, otherwise a table `{ node = ..., instance = ..., peers = ..., displays = ... }`
----    where `peers[name]` is `{ lastSeen = ms|nil, active = boolean|nil, alive = boolean }` and
----    `displays[id]` is `{ owner = node|nil, visible = boolean, input = number|nil }`
+---    where `peers[name]` is `{ lastSeen = ms|nil, active = boolean|nil, alive = boolean }`
+---    (`lastSeen`: epoch milliseconds of the last verified message from the peer, nil if never; `active`:
+---    the peer's replicated presence, false when it is inactive, nil when nothing is known about it; `alive`:
+---    heard from within 3 heartbeat intervals) and `displays[id]` is
+---    `{ owner = node|nil, visible = boolean, input = number|nil }` (`owner`: recorded owner, nil when
+---    unknown; `visible`: this Mac currently sees the monitor; `input`: this node's DDC input)
 function obj:status()
   if self._node == nil then return nil end
   return self._node:status()

@@ -502,10 +502,13 @@ end
 
 -- ---------------------------------------------------------------- public API
 
+-- Returns true, or false and a reason when the transport cannot listen (nothing is left running).
 function Node:start()
-  if self.running then return end
+  if self.running then return true end
+  local listening, startFailure = self.transport:start(function(msg) return self:onMessage(msg) end,
+    function(from) self:_seen(from) end)
+  if listening == false then return false, startFailure end
   self.running = true
-  self.transport:start(function(msg) return self:onMessage(msg) end, function(from) self:_seen(from) end)
 
   local useLid = self.cfg.activity ~= nil and self.cfg.activity.lid == true and self.lid ~= nil
   if useLid then self.lid:start(function(closed) self:_onLid(closed) end) end
@@ -527,6 +530,7 @@ function Node:start()
   self.heartbeat = self.timer.doEvery(self.cfg.heartbeat, function() self:_heartbeat() end)
 
   if active then self:_onActive("start") end
+  return true
 end
 
 function Node:stop()
@@ -576,7 +580,7 @@ function Node:status()
     local presence = self.state:presence(node)
     peers[node] = {
       lastSeen = self.lastSeen[node],
-      active = presence and presence.active or nil,
+      active = presence and presence.active, -- false when inactive, nil when never heard of
       alive = self:alive(node),
     }
   end

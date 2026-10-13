@@ -139,6 +139,18 @@ describe("Config", function()
     it("must not be empty", function()
       fails(with(function(r) r.displays = {} end), "displays")
     end)
+
+    it("rejects the array form (display ids must be strings)", function()
+      fails(with(function(r) r.displays = { r.displays.left } end), "displays")
+    end)
+
+    it("rejects mixed keys without crashing", function()
+      fails(with(function(r) r.displays[1] = r.displays.left end), "displays")
+    end)
+
+    it("rejects an empty display id", function()
+      fails(with(function(r) r.displays[""] = r.displays.left end), "displays")
+    end)
     it("need inputs", function()
       fails(with(function(r) r.displays.left.inputs = nil end), "inputs")
     end)
