@@ -1,0 +1,19 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: leafo/gh-actions-lua@v13
+        with:
+          luaVersion: "5.4"
+      - uses: leafo/gh-actions-luarocks@v6
+      - name: Install test tools
+        run: luarocks install busted && luarocks install luacheck && luarocks install dkjson
+      - name: Lint
+        run: luacheck .
+      - name: Test
+        run: busted
