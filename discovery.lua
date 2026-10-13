@@ -63,12 +63,24 @@ function Discovery:_onResolved(svc, onUp)
   if not known then onUp(node) end
 end
 
+-- Our own published service shows up in the browse results and cannot be resolved. Bonjour may
+-- have renamed it on a collision, so compare against the name it actually has now.
+function Discovery:_isOwnService(svc)
+  local own = self.service
+  if own == nil then return false end
+  if svc == own then return true end
+  local ok, name = pcall(svc.name, svc)
+  local okOwn, ownName = pcall(own.name, own)
+  return ok and okOwn and name ~= nil and name == ownName
+end
+
 function Discovery:_browse(onUp, onDown)
   self.browser = self.bonjour.new()
   self.browser:findServices(SERVICE_TYPE, DOMAIN, function(_, _, added, svc)
     if added then
+      if self:_isOwnService(svc) then return end
       self.pending[svc] = true
-      svc:resolve(RESOLVE_TIMEOUT, function(s, event, err)
+      local ok, resolveErr = pcall(svc.resolve, svc, RESOLVE_TIMEOUT, function(s, event, err)
         self.pending[svc] = nil
         if event == "resolved" then
           self:_onResolved(s, onUp)
@@ -76,6 +88,10 @@ function Discovery:_browse(onUp, onDown)
           self.log.d("could not resolve service " .. tostring(svc:name()) .. ": " .. tostring(err or event))
         end
       end)
+      if not ok then
+        self.pending[svc] = nil
+        self.log.d("could not resolve service: " .. tostring(resolveErr))
+      end
     else
       self.pending[svc] = nil
       local name = svc:name()

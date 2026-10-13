@@ -36,7 +36,7 @@ describe("Discovery", function()
     it("publishes the service with the group TXT record", function()
       start()
       local svc = bonjour.published[1]
-      assert.are.equal("desk-mini", svc.name)
+      assert.are.equal("desk-mini", svc:name())
       assert.are.equal("_displaykvm._tcp.", svc.serviceType)
       assert.are.equal(8765, svc.port)
       assert.are.same({ v = "1", group = "abcd1234", node = "desk-mini" }, svc.txt)
@@ -108,6 +108,42 @@ describe("Discovery", function()
       bonjour.browsers[1].add(remote("desk-mini (2)", "desk-mini"))
       assert.are.same({}, up)
       assert.are.same({}, d:names())
+    end)
+
+    it("never resolves its own published service", function()
+      local own = bonjour.published[1]
+      assert.has_no.errors(function() bonjour.browsers[1].add(own) end)
+      assert.are.same({}, up)
+      assert.are.same({}, d:names())
+    end)
+
+    it("still skips its own service after Bonjour renamed it", function()
+      local own = bonjour.published[1]
+      own.rename("desk-mini (2)")
+      assert.has_no.errors(function() bonjour.browsers[1].add(own) end)
+      assert.are.same({}, up)
+    end)
+
+    it("skips a distinct object that carries our published name", function()
+      local copy = remote("desk-mini", "desk-mini")
+      copy.resolve = function() error("must not be resolved") end
+      assert.has_no.errors(function() bonjour.browsers[1].add(copy) end)
+      assert.are.same({}, up)
+    end)
+
+    it("survives an unexpected error from resolve and logs it at debug level", function()
+      local entries = {}
+      d = make({ log = { d = function(m) entries[#entries + 1] = m end } })
+      start()
+      local bad = remote("boom", "boom")
+      bad.resolve = function() error("unexpected") end
+      assert.has_no.errors(function() bonjour.browsers[2].add(bad) end)
+      assert.are.equal(1, #entries)
+      assert.is_truthy(entries[1]:find("unexpected", 1, true))
+      assert.is_nil(d.pending[bad])
+      local good = remote("laptop", "laptop")
+      bonjour.browsers[2].add(good)
+      assert.are.same({ "laptop" }, up)
     end)
 
     it("skips entries whose resolution fails or times out", function()

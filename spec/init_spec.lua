@@ -250,6 +250,57 @@ describe("init", function()
       assert.are.equal(401, status)
     end)
 
+    describe("secret hygiene", function()
+      local deepContains = dofile("spec/support/deep.lua")
+
+      it("deepContains finds a value nested in tables, keys, metatables and substrings", function()
+        local hidden = setmetatable({}, { __index = { deep = { "xx" .. SECRET .. "yy" } } })
+        assert.is_true(deepContains({ a = { b = SECRET } }, SECRET))
+        assert.is_true(deepContains({ [SECRET] = 1 }, SECRET))
+        assert.is_true(deepContains({ hidden }, SECRET))
+        local cyclic = {}
+        cyclic.self = cyclic
+        assert.is_false(deepContains(cyclic, SECRET))
+      end)
+
+      it("keeps the secret out of everything reachable from the Spoon object", function()
+        obj:start()
+        assert.is_false(deepContains(obj, SECRET))
+        assert.is_false(deepContains(obj._node, SECRET))
+        assert.is_false(deepContains(obj._cfg, SECRET))
+      end)
+
+      it("keeps it out after claim, release and when returned from them", function()
+        obj:start()
+        assert.is_false(deepContains(obj:claim(), SECRET))
+        assert.is_false(deepContains(obj:release(), SECRET))
+        assert.is_false(deepContains(obj:status(), SECRET))
+      end)
+
+      it("keeps it out when configured but not started", function()
+        assert.is_false(deepContains(obj, SECRET))
+      end)
+
+      it("survives a restart: the secret is still found at start()", function()
+        obj:start()
+        obj:start()
+        assert.is_false(deepContains(obj, SECRET))
+        assert.is_true(hs.httpserver.created[2].started)
+      end)
+
+      it("never logs the secret", function()
+        obj:configure(validConfig({ logLevel = "debug" }))
+        obj:start()
+        obj:claim()
+        obj:release()
+        obj:stop()
+        assert.is_true(#obj._log.messages > 0)
+        for _, entry in ipairs(obj._log.messages) do
+          assert.is_nil(tostring(entry[2]):find(SECRET, 1, true))
+        end
+      end)
+    end)
+
     it("publishes no Bonjour service when bonjour = false", function()
       obj:configure(validConfig({ bonjour = false }))
       obj:start()

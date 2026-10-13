@@ -30,6 +30,12 @@ describe("Message", function()
     laptop = make("laptop", "inst-laptop")
   end)
 
+  it("keeps the secret out of the object", function()
+    local deepContains = dofile("spec/support/deep.lua")
+    desk:build("state", {})
+    assert.is_false(deepContains(desk, "shared-secret"))
+  end)
+
   describe("build", function()
     it("produces the envelope and signs the raw string", function()
       local raw, sig = desk:build("state", { x = 1 })

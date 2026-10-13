@@ -34,6 +34,10 @@ obj.author = "Grzegorz Dzięgielewski <jabbas@jabbas.eu>"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 obj.homepage = "https://github.com/jabbas/DisplayKVM"
 
+-- The group secret, keyed by the Spoon object. Private to this file and weak-keyed, so it never
+-- appears in a table that hs.inspect(spoon.DisplayKVM) would print.
+local secrets = setmetatable({}, { __mode = "k" })
+
 local BACKEND_FILES = { "m1ddc", "ddcctl", "betterdisplay", "lunar" }
 
 -- Loads a file that ships with the Spoon. Only called from methods, never at file load.
@@ -120,8 +124,12 @@ function obj:configure(raw)
     log.e(err)
     hs.notify.new({ title = "DisplayKVM", informativeText = err }):send()
     self._cfg = nil
+    secrets[self] = nil
     return self
   end
+  -- The secret is kept out of every inspectable field; it is only handed to the Message at start().
+  secrets[self] = cfg.secret
+  cfg.secret = nil
   self._cfg = cfg
   self:_logger(cfg.logLevel)
   return self
@@ -158,10 +166,11 @@ local function buildNode(self, cfg)
   local Policy = loadModule("policy.lua")
 
   local instance = randomHex(8)
-  local groupId = hs.hash.new("SHA256"):append(cfg.secret):finish():value():sub(1, 8)
+  local secret = secrets[self]
+  local groupId = hs.hash.new("SHA256"):append(secret):finish():value():sub(1, 8)
 
   local message = Message.new({
-    secret = cfg.secret,
+    secret = secret,
     node = cfg.node,
     instance = instance,
     hmac = hmac,

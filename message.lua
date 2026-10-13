@@ -18,10 +18,11 @@ end
 
 function Message.new(deps)
   local self = setmetatable({}, Message)
-  self.secret = deps.secret
+  -- The secret lives only in this closure so that inspecting the object (hs.inspect) cannot reveal it.
+  local secret, hmac = deps.secret, deps.hmac
+  self._sign = function(raw) return hmac(secret, raw) end
   self.node = deps.node
   self.instance = deps.instance
-  self.hmac = deps.hmac
   self.now = deps.now
   self.random = deps.random
   self.codec = deps.codec
@@ -41,7 +42,7 @@ function Message:build(type, body)
     type = type,
     body = body,
   })
-  return raw, self.hmac(self.secret, raw)
+  return raw, self._sign(raw)
 end
 
 function Message:_purge(now)
@@ -56,7 +57,7 @@ function Message:verify(raw, sig)
   local now = self.now()
   self:_purge(now)
 
-  if type(raw) ~= "string" or not Message.constantTimeEqual(self.hmac(self.secret, raw), sig) then
+  if type(raw) ~= "string" or not Message.constantTimeEqual(self._sign(raw), sig) then
     return nil, "bad-signature"
   end
 

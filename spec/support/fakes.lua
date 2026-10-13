@@ -62,8 +62,10 @@
 --           (browser, "local.", isAdded, service, moreComing); fields: serviceType, domain, stopped
 --   browser.add(svc) / browser.remove(svc) -- fire the callback with isAdded true / false
 --   bonjour.browsers                  -- every browser created
---   bonjour.service.new(name, type, port) -> published service {txtRecord(tbl), publish(), stop()};
---           fields: name, serviceType, port, txt, published, stopped
+--   bonjour.service.new(name, type, port) -> published service {name(), txtRecord(tbl), publish(), stop(),
+--           rename(newName), resolve()}; resolve raises like real Hammerspoon ("can't resolve a service
+--           created for publishing"); rename simulates a Bonjour collision rename;
+--           fields: serviceType, port, txt, published, stopped
 --   bonjour.published                 -- every service created through service.new
 --   bonjour.remote({name, host, port, txt, result, err}) -> remote service object with
 --           :name(), :hostname(), :port(), :txtRecord(), :resolve(timeout, cb)
@@ -300,7 +302,12 @@ function fakes.bonjour()
   end
 
   function bonjour.service.new(name, serviceType, port)
-    local svc = { name = name, serviceType = serviceType, port = port, published = false, stopped = false }
+    local svc = { serviceType = serviceType, port = port, published = false, stopped = false }
+    local current = name
+    function svc.name() return current end
+    function svc.rename(newName) current = newName end -- Bonjour renames on a name collision
+    -- Like real Hammerspoon, a service created for publishing cannot be resolved.
+    function svc.resolve() error("can't resolve a service created for publishing", 2) end
     function svc.txtRecord(_, tbl) svc.txt = tbl return svc end
     function svc.publish() svc.published = true return svc end
     function svc.stop() svc.published = false svc.stopped = true return svc end
