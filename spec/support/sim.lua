@@ -15,8 +15,12 @@
 --                 status "unreachable"; "timeout": it fails after the 5 s soft timeout with "timeout".
 --                 A reply lost to a partition always fails with "timeout" after the soft timeout.
 --   mute         {name = true}: that node's Discovery reports no peers, so it never initiates contact
+--   static       {node = "host:port"}: every other node reaches that node only by the address (as with
+--                 static peers and no mDNS) until a reply teaches the alias, like the real Transport
 --   lid          true enables the lid sensor in the node config
 --
+-- DDC: sim.ddcLatency (seconds, default 0.1) is how long an async switchTo takes; sim.ddcApply = "end"
+--   (default) applies the command when it completes, "start" applies it at once and only reports later.
 -- Clock: one shared fakes.timer(); sim.now() is BASE + fake seconds, in integer ms.
 -- Sensors (per node name, survive restarts): sim:setLocked(name, bool), sim:setIdle(name, sec) before
 --   sim:start; sim:activate / lock / sleep (systemWillSleep, sync) / lid(name, closed) fire events.
@@ -92,8 +96,12 @@ local function newDisplay(sim, node, id, spec)
     counts.switchTo = counts.switchTo + 1
     if spec.inputs[target] == nil then return done(false, "unknown-node") end
     if not self:visible() then return done(false, "not-visible") end
-    sim.timer.doAfter(DDC_LATENCY, function()
-      if sim.monitor:command(node, target) then done(true) else done(false, "backend-error") end
+    local ok
+    local early = sim.ddcApply == "start"
+    if early then ok = sim.monitor:command(node, target) end
+    sim.timer.doAfter(sim.ddcLatency, function()
+      if not early then ok = sim.monitor:command(node, target) end
+      if ok then done(true) else done(false, "backend-error") end
     end)
   end
 
@@ -112,6 +120,14 @@ local function newTransport(sim, entry)
   local name = entry.name
   local counts = sim.counts[name]
   local t = {}
+
+  -- Peers configured by address are only known by their address until a reply teaches the alias.
+  local function resolve(peer)
+    local byAddress = sim.addressOwner[peer]
+    if byAddress then return sim.routes[byAddress] end
+    if sim.static[peer] and entry.aliases[peer] == nil then return nil end
+    return sim.routes[peer]
+  end
 
   local function reachable(target)
     return target ~= nil and target.listening and not sim.partitioned[name] and not sim.partitioned[target.name]
@@ -132,21 +148,22 @@ local function newTransport(sim, entry)
     local lat = sim.latency
     local function fail(delay, status) sim.timer.doAfter(delay, function() cb(false, nil, status) end) end
 
-    if sim.routes[peer] == nil then return fail(0, "unknown-peer") end
-    if not reachable(sim.routes[peer]) then
+    if resolve(peer) == nil then return fail(0, "unknown-peer") end
+    if not reachable(resolve(peer)) then
       if sim.partitionMode == "timeout" then return fail(SOFT_TIMEOUT, "timeout") end
       return fail(0, "unreachable")
     end
 
     local msg = envelope(msgType, body)
     sim.timer.doAfter(lat, function()
-      local target = sim.routes[peer]
+      local target = resolve(peer)
       if not reachable(target) then return fail(SOFT_TIMEOUT - lat, "timeout") end
       local status, reply = target.onMessage(copy(msg))
       sim.timer.doAfter(lat, function()
-        if not reachable(sim.routes[peer]) then return cb(false, nil, "timeout") end
+        if not reachable(resolve(peer)) then return cb(false, nil, "timeout") end
         if status == 200 and reply ~= nil then
-          entry.onSeen(peer)
+          if sim.addressOwner[peer] then entry.aliases[target.name] = peer end
+          entry.onSeen(target.name)
           cb(true, copy(reply), 200)
         elseif status == 204 then
           cb(true, nil, 204)
@@ -160,7 +177,7 @@ local function newTransport(sim, entry)
   function t:sendSync(peer, msgType, body, _)
     counts.sendSync = counts.sendSync + 1
     sim:_record(name, peer, msgType, body, true)
-    local target = sim.routes[peer]
+    local target = resolve(peer)
     if not reachable(target) then return false end
     local status = target.onMessage(envelope(msgType, body))
     return status == 200 or status == 204
@@ -185,7 +202,7 @@ local function newDiscovery(sim, entry)
     local out = {}
     if sim.mute[entry.name] then return out end
     for name, other in pairs(sim.routes) do
-      if name ~= entry.name and other.listening then out[#out + 1] = name end
+      if name ~= entry.name and other.listening then out[#out + 1] = sim.static[name] or name end
     end
     table.sort(out)
     return out
@@ -198,7 +215,7 @@ local function newDiscovery(sim, entry)
 
   function d:stop() entry.discoveryStarted = false end
   function d:resolve(name) return sim.routes[name] and { host = name, port = 0 } or nil end
-  function d:alias() end
+  function d:alias(node, address) entry.aliases[node] = address end
 
   return d
 end
@@ -211,7 +228,7 @@ end
 
 function Sim:_build(name)
   local sensors = self.sensors[name]
-  local entry = { name = name }
+  local entry = { name = name, aliases = {} }
   self.instanceCounter = self.instanceCounter + 1
   entry.instance = name .. "-instance-" .. self.instanceCounter
   entry.state = State.new()
@@ -282,6 +299,11 @@ function Sim.new(opts)
   self.latency = opts.latency or 0.01
   self.partitionMode = opts.partitionMode or "unreachable"
   self.mute = opts.mute or {}
+  self.static = opts.static or {}
+  self.addressOwner = {}
+  for node, address in pairs(self.static) do self.addressOwner[address] = node end
+  self.ddcLatency = DDC_LATENCY
+  self.ddcApply = "end"
   self.lidEnabled = opts.lid == true
   self.monitor = newMonitor({
     inputs = opts.monitor.inputs,
@@ -304,7 +326,9 @@ function Sim:_startEntry(entry)
   self.routes[entry.name] = entry
   entry.node:start()
   for _, other in pairs(self.routes) do
-    if other ~= entry and other.discoveryStarted and not self.mute[other.name] then other.onUp(entry.name) end
+    if other ~= entry and other.discoveryStarted and not self.mute[other.name] then
+      other.onUp(self.static[entry.name] or entry.name)
+    end
   end
 end
 

@@ -14,6 +14,7 @@ local function make(o)
     pull = o.pull,
     mute = o.mute,
     lid = o.lid,
+    static = o.static,
     partitionMode = o.partitionMode,
     monitor = { inputs = inputs, mode = o.mode, acceptsInactive = o.acceptsInactive, input = o.input },
   })
@@ -348,6 +349,57 @@ describe("Node scenarios", function()
     assert.is_true(sim:node("desk-mini"):alive("laptop"))
   end)
 
+  describe("in-flight switches racing with lock and unlock", function()
+    local function allAgree(sim, expectedInput, expectedOwner)
+      assert.equal(expectedInput, sim:input())
+      allOwners(sim, { "desk-mini", "laptop" }, expectedOwner)
+    end
+
+    it("R1a a lock right after an unlock hands the display back (request path)", function()
+      local sim = make()
+      sim:activate("laptop")
+      sim:lock("laptop") -- no advance: the request is still in flight
+      sim:advance(5)
+      allAgree(sim, 15, "desk-mini")
+    end)
+
+    it("R1a a lock right after an unlock hands the display back (pull path)", function()
+      local sim = make({ mode = "sticky", acceptsInactive = true })
+      sim:activate("laptop")
+      sim:lock("laptop") -- the pull is still in flight
+      sim:advance(5)
+      allAgree(sim, 15, "desk-mini")
+    end)
+
+    it("R1b an unlock while the release is still in flight claims again afterwards", function()
+      local sim = make()
+      sim:activate("laptop")
+      sim:advance(1)
+      sim.ddcLatency = 0.3
+      sim:lock("laptop") -- the release lands at +0.3 s
+      sim.ddcLatency = 0.05
+      sim:activate("laptop") -- the pull lands first, the release after it
+      sim:advance(10)
+      allAgree(sim, 16, "laptop")
+    end)
+
+    it("R1c a request pushed during an async release is not overwritten by the release", function()
+      local sim = make({
+        nodes = { "desk-mini", "laptop", "studio" }, mode = "sticky", acceptsInactive = true, pull = false,
+      })
+      sim:activate("laptop")
+      sim:advance(1)
+      assert.equal(16, sim:input())
+      sim.ddcApply = "start"
+      sim.ddcLatency = 0.3
+      sim:lock("laptop") -- the release command is sent now, its completion arrives at +0.3 s
+      sim:activate("studio") -- studio asks the laptop meanwhile
+      sim:advance(10)
+      assert.equal(17, sim:input())
+      allOwners(sim, { "desk-mini", "laptop", "studio" }, "studio")
+    end)
+  end)
+
   it("S16 releasing to a home that is not alive still switches and records the owner", function()
     local sim = make()
     sim:activate("laptop")
@@ -359,6 +411,19 @@ describe("Node scenarios", function()
     sim:advance(1)
     assert.equal(15, sim:input())
     assert.equal("desk-mini", sim:owner("laptop"))
+  end)
+end)
+
+describe("Node sleep broadcast with static peers", function()
+  it("S10b reaches a peer known only by address, through the alias learned from its hello reply", function()
+    local sim = make({ static = { ["desk-mini"] = "192.0.2.1:8765" } })
+    assert.same({ "192.0.2.1:8765" }, sim.entries.laptop.discovery:names())
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:sleep("laptop") -- no advance
+    assert.equal(1, #sim:sent({ from = "laptop", to = "desk-mini", sync = true }))
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.is_false(sim:presence("desk-mini", "laptop").active)
   end)
 end)
 

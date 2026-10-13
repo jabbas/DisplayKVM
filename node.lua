@@ -1,8 +1,28 @@
 -- Node: orchestrates sensors, policy, displays and transport (design §5, §7, §10).
 -- Every collaborator is injected through `deps`; this module does not touch Hammerspoon.
+--
 --   Node.new(cfg, deps)
---   deps = {state, policy, instances, instance, displays = {[id] = Display}, transport, discovery,
---           activity, lid, now = fn() -> ms, timer, log = {d, i, w, e}, notify = fn(kind, text)}
+--
+-- cfg: the validated Config table. Used fields: node (this node's name), heartbeat (seconds),
+--   displays[id].inputs (read by Policy), activity.lid (boolean), plus whatever Policy reads from it.
+--
+-- deps (all required unless marked optional):
+--   state      State object (:setOwner :setPresence :owner :presence :merge :snapshot)
+--   policy     the Policy module table (.onActive(state, cfg, me), .onInactive(state, cfg, me, alive))
+--   instances  object with :observe(name, instance, nowMs) -> "first"|"same"|"replaced"|"duplicate"|"stale"
+--              (see instances.lua; built with Instances.new(2 * heartbeat * 1000))
+--   instance   string, random per start, reported by status()
+--   displays   {[id] = Display}: .id .pull :inputFor(node) :visible() :switchTo(node, done(ok, reason))
+--              :switchToSync(node, timeoutSec) -> ok, reason
+--   transport  Transport: :start(onMessage, onSeen) :stop() :send(peer, type, body, cb(ok, reply, status))
+--              :sendSync(peer, type, body, timeoutSec) -> ok
+--   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names()
+--   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
+--   lid        optional LidSensor: :start(onChange(closed)) :stop() :closed(); used only if cfg.activity.lid
+--   now        function() -> integer milliseconds (also the clock for State timestamps)
+--   timer      hs.timer-like: doAfter(sec, fn), doEvery(sec, fn), both returning an object with :stop()
+--   log        optional {d, i, w, e} functions taking one string
+--   notify     optional function(kind, text); rate limiting (1 per 300 s per kind) is done by Node
 
 local Node = {}
 Node.__index = Node
@@ -106,13 +126,18 @@ function Node:_broadcast()
   end
 end
 
--- Sleep path: blocking sends, alive peers only (a dead peer would block the whole wake-up).
+-- Sleep path: blocking sends, alive peers only (a dead peer would block the whole wake-up). Peers are
+-- addressed by node name: discovery:names() may hold bare host:port strings (static peers), whose
+-- liveness is keyed by node name; Discovery:resolve maps the name back through the learned alias.
 function Node:_broadcastSync()
   local body = self:_stateBody()
-  for _, name in ipairs(self.discovery:names()) do
-    if self:alive(name) then
-      self.transport:sendSync(name, "state", body, SLEEP_SEND_TIMEOUT)
-    end
+  local names = {}
+  for name in pairs(self.lastSeen) do
+    if name ~= self.me and self:alive(name) then names[#names + 1] = name end
+  end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    self.transport:sendSync(name, "state", body, SLEEP_SEND_TIMEOUT)
   end
 end
 
@@ -122,16 +147,17 @@ function Node:_live(intent)
   return self.running and self.active and self.intents[intent.id] == intent
 end
 
-function Node:_cancelIntent(id)
+function Node:_cancelIntent(id, why)
   local intent = self.intents[id]
   if not intent then return end
+  intent.cancelled = why
   if intent.timer then intent.timer:stop() end
   if intent.verify then intent.verify:stop() end
   self.intents[id] = nil
 end
 
-function Node:_cancelIntents()
-  for id in pairs(self.intents) do self:_cancelIntent(id) end
+function Node:_cancelIntents(why)
+  for id in pairs(self.intents) do self:_cancelIntent(id, why) end
 end
 
 function Node:_startClaim(id)
@@ -159,9 +185,17 @@ function Node:_ask(intent, targets, cb)
   local pending, settled = #targets, false
   for _, peer in ipairs(targets) do
     self.transport:send(peer, "request", { display = intent.id, to = self.me }, function(ok, reply, status)
-      if settled or not self:_live(intent) then return end
+      if settled then return end
+      local granted = ok and type(reply) == "table" and reply.result == "ok"
+      if not self:_live(intent) then
+        if granted then
+          settled = true
+          self:_lateClaim(intent)
+        end
+        return
+      end
       pending = pending - 1
-      if ok and type(reply) == "table" and reply.result == "ok" then
+      if granted then
         settled = true
         return cb(true)
       end
@@ -185,7 +219,10 @@ function Node:_attempt(intent)
   local display = self.displays[id]
   if display:visible() and display.pull ~= false then
     display:switchTo(self.me, function(ok, reason)
-      if not self:_live(intent) then return end
+      if not self:_live(intent) then
+        if ok then self:_lateClaim(intent) end
+        return
+      end
       if ok then return self:_claimed(intent, false) end
       self.log.w("pull of " .. id .. " failed: " .. tostring(reason))
       self:_retry(intent)
@@ -223,6 +260,21 @@ function Node:_fallback(intent, owner)
   end
   intent.attempts = intent.attempts + 1
   self:_broadcastRequest(intent, owner)
+end
+
+-- A switch that was in flight when the node went inactive has landed: the monitor now shows this
+-- node although the state names someone else. Record it, then give the display back.
+function Node:_lateClaim(intent)
+  if intent.cancelled ~= "inactive" or not self.running or self.active then return end
+  local id = intent.id
+  self.log.i("claim of " .. id .. " landed after going inactive, releasing it")
+  self:_writeOwner(id, self.me)
+  local alive = function(name) return self:alive(name) end
+  local targets = {}
+  for _, t in ipairs(self.policy.onInactive(self.state, self.cfg, self.me, alive)) do
+    if t.display == id then targets[#targets + 1] = t end
+  end
+  self:_releaseAsync(targets)
 end
 
 function Node:_claimed(intent, viaRequest)
@@ -300,7 +352,7 @@ end
 function Node:_onInactive(reason, sync)
   self.log.i("inactive (" .. tostring(reason) .. ")" .. (sync and " [sync]" or ""))
   self.active = false
-  self:_cancelIntents()
+  self:_cancelIntents("inactive")
   self:_setPresence(false)
 
   local alive = function(name) return self:alive(name) end
@@ -319,15 +371,26 @@ function Node:_onInactive(reason, sync)
   end
 
   self:_broadcast()
+  self:_releaseAsync(targets)
+end
+
+-- Async release of {display, target} pairs. When the switch lands the situation may have changed:
+-- the node may be active again (claim afresh, the monitor now shows the target) or a peer may have
+-- taken the display meanwhile (leave its owner record alone).
+function Node:_releaseAsync(targets)
   for _, t in ipairs(targets) do
-    if not self.releasing[t.display] then
-      self.releasing[t.display] = true
-      self.displays[t.display]:switchTo(t.target, function(ok, why)
-        self.releasing[t.display] = nil
+    local id = t.display
+    if not self.releasing[id] then
+      self.releasing[id] = true
+      self.displays[id]:switchTo(t.target, function(ok, why)
+        self.releasing[id] = nil
         if not self.running then return end
-        if not ok then return self.log.e("release of " .. t.display .. " failed: " .. tostring(why)) end
-        if self.active then return end -- became active again meanwhile; the new claim decides
-        self:_writeOwner(t.display, t.target)
+        if not ok then return self.log.e("release of " .. id .. " failed: " .. tostring(why)) end
+        if self.active then return self:_startClaim(id) end
+        if self.state:owner(id) ~= self.me then
+          return self.log.i("release of " .. id .. " landed but " .. tostring(self.state:owner(id)) .. " owns it now")
+        end
+        self:_writeOwner(id, t.target)
         self:_broadcast()
       end)
     end
