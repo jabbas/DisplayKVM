@@ -15,6 +15,8 @@
 --   opts.timer, opts.latency: if given, an instance completes `latency` (default 0) seconds after
 --           :start() when the timer is advanced; otherwise the test completes it manually.
 --   task.new(path, callback, args) -> {start(), isRunning(), terminate()}   (task(...) is an alias)
+--           terminate() on a running instance marks it terminated and invokes callback(15, "", "")
+--           synchronously, like the real hs.task; on a finished/unstarted instance it is a no-op.
 --   task.created                      -- every instance: {path, args, started, terminated, done}
 --   task.finish([n])                  -- completes instance n (default: oldest started, running one);
 --                                        returns the instance
@@ -125,9 +127,14 @@ function fakes.task(script, opts)
       return inst
     end
     function inst.isRunning() return inst.running == true end
+    -- Like the real hs.task, terminating a running task still invokes its callback (SIGTERM -> 15).
     function inst.terminate()
+      if not inst.running then return inst end
       inst.terminated = true
+      inst.done = true
       inst.running = false
+      inst.callback(15, "", "")
+      return inst
     end
     return inst
   end
