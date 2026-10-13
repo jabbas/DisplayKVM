@@ -14,7 +14,9 @@
 --           An entry may also be a function(path, args) returning such a table.
 --   opts.timer, opts.latency: if given, an instance completes `latency` (default 0) seconds after
 --           :start() when the timer is advanced; otherwise the test completes it manually.
---   task.new(path, callback, args) -> {start(), isRunning(), terminate()}   (task(...) is an alias)
+--   task.new(path, callback, args) -> {start(), isRunning(), terminate(), terminationStatus()}
+--           (task(...) is an alias); terminationStatus() is the exit code once finished (15 if
+--           terminated), nil before that
 --           terminate() on a running instance marks it terminated and invokes callback(15, "", "")
 --           synchronously, like the real hs.task; on a finished/unstarted instance it is a no-op.
 --   task.created                      -- every instance: {path, args, started, terminated, done}
@@ -127,6 +129,12 @@ function fakes.task(script, opts)
       return inst
     end
     function inst.isRunning() return inst.running == true end
+    -- Exit code once the instance has finished (15 after terminate()), nil while it is unfinished.
+    function inst.terminationStatus()
+      if inst.terminated then return 15 end
+      if inst.done then return inst.result[1] end
+      return nil
+    end
     -- Like the real hs.task, terminating a running task still invokes its callback (SIGTERM -> 15).
     function inst.terminate()
       if not inst.running then return inst end
