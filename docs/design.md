@@ -89,8 +89,8 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 | `ActivitySensor` | Turns `hs.caffeinate.watcher`, idle time and lock state into `active` / `inactive` events. See below. | hs.caffeinate, hs.host |
 | `LidSensor` | Reads the lid state with `ioreg -r -k AppleClamshellState -d 1`, run asynchronously, debounced by 1.5 s on `hs.screen.watcher`. Lid closed → inactive. Lid open and unlocked → active. Lid open and locked → wait for unlock. No-op on machines without a lid; disabled by `activity.lid = false`. | hs.screen.watcher, hs.task |
 | `Display` | One configured monitor: match (UUID or name pattern, per node or global), inputs map node → DDC input, home, `pull` flag, backend options. Methods: `visible()`, `switchTo(node, done)` with retry. | Backend |
-| `Backend` | Common interface `setInput(display, input, done)`, always asynchronous through `hs.task` with a 5 s timeout. A synchronous variant (`waitUntilExit`, 2 s) is used only on `systemWillSleep`. Built-ins: `m1ddc`, `ddcctl`, `betterdisplay` (`betterdisplaycli`), `lunar`; or a user function `(display, input, done)`. | hs.task |
-| `Transport` | `hs.httpserver` serving `POST /v1/msg`, plus a client (`hs.http.asyncPost`). HMAC-SHA256 sign and verify; rejects stale and replayed messages. | hs.httpserver, hs.http, hs.hash |
+| `Backend` | Common interface `setInput(display, input, done)`, always asynchronous through `hs.task` with a 5 s timeout. A synchronous variant, used only on `systemWillSleep` and when answering a peer's `request`, starts the task and polls `isRunning` until it ends or the limit (2 s on sleep, 3 s for a `request`) expires, then terminates it. Built-ins: `m1ddc`, `ddcctl`, `betterdisplay` (`betterdisplaycli`), `lunar`; or a user function `(display, input, done)`. A user function must call `done` before it returns: the synchronous variant cannot wait for a later call, treats a pending `done` as a failure and logs a one-time warning. | hs.task |
+| `Transport` | `hs.httpserver` serving `POST /v1/msg`, plus a client (`hs.http.asyncPost`). HMAC-SHA256 sign and verify; rejects stale and replayed messages. Request bodies are limited to 64 KiB. `hs.httpserver:start()` does not raise when it cannot listen, so `start()` checks `getPort()`; on failure it logs, the Spoon notifies "cannot listen on port <n>" and no node is kept. | hs.httpserver, hs.http, hs.hash |
 | `Discovery` | Publishes this node's Bonjour service, browses peers' services, merges in the static `peers` list. | hs.bonjour |
 
 `ActivitySensor` rules:
@@ -100,7 +100,7 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 - `screensDidLock` / `screensDidSleep` / `systemWillSleep` → `inactive`.
 - At start: unlocked and idle time < `startIdle` (30 s) → `active`; otherwise `inactive` with no action.
 
-Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `config.lua`, `message.lua`, `activity.lua`, `lid.lua`, `runner.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
+Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `config.lua`, `message.lua`, `instances.lua`, `activity.lua`, `lid.lua`, `runner.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
 
 ```d2
 direction: right
@@ -168,7 +168,7 @@ Messages are `POST /v1/msg` with a JSON body and the header `X-DisplayKVM-Sig: h
 
 | type | When | Body / reply |
 |---|---|---|
-| `hello` | On start and when a new peer is discovered | The sender's full state. The reply is the receiver's full state (two-way sync). |
+| `hello` | On start and when a new peer is discovered. A peer configured only by a static address is announced once, at start, so a `hello` is also re-sent on every heartbeat to each static address whose node name is not yet known, and when a message arrives from a node that cannot be routed to yet | The sender's full state. The reply is a signed `reply` envelope with the receiver's full state (two-way sync); it is also how a node learns the name behind a static address. |
 | `state` | After every local change and every `heartbeat` seconds (default 30) | Changed records or full state. Reply 204. |
 | `request` | A claim when pulling is not possible | `{display, to}` sent to the owner. The owner pushes. Reply `ok` or `failed`. |
 
@@ -194,7 +194,7 @@ Any failure returns 401 with no details.
 
 The owner always sees the display, because it is showing the owner's input, so a push is reliable. The target is chosen by Policy (D3). Releasing to `home` does **not** require home to be alive: if home is off or asleep, the monitor shows "no signal" until someone claims it. This is deliberate — it matches the simple "give it back" behaviour people expect, and the next claim repairs the state.
 
-On `systemWillSleep` both the switch and the state broadcast are synchronous (`hs.http.doRequest`, 1 s per peer), because asynchronous work does not complete before the machine sleeps.
+On `systemWillSleep` both the switch and the state broadcast are synchronous, because asynchronous work does not complete before the machine sleeps. The broadcast goes to every alive peer, one after another, with `hs.http.doRequest`. That call has no timeout parameter, so each send blocks until the peer answers or the network stack gives up: an alive-but-unreachable peer (for example one that has just lost its network) can delay the sleep. Dead peers are skipped, which bounds the common case.
 
 ```d2
 shape: sequence_diagram
@@ -259,13 +259,14 @@ spoon.DisplayKVM:bindHotkeys({ claim = { { "ctrl", "alt", "cmd" }, "M" } })  -- 
 | `port` | no | `8765` | Server port. |
 | `peers` | no | — | Static list of `"host:port"` in addition to Bonjour. |
 | `bonjour` | no | `true` | `false` disables discovery (static peers only). |
+| `interface` | no | — | Bind the HTTP server to one network interface (`hs.httpserver:setInterface`). |
 | `activity` | no | `{ userIdle = 5, startIdle = 30, lid = true }` | Thresholds. Use `lid = false` for desktops and clamshell users. |
 | `heartbeat` | no | `30` | Seconds between `state` heartbeats. A node is absent after 3 silent intervals. |
 | `logLevel` | no | `"info"` | Level of the `DisplayKVM` logger. |
 
 **Validation.** `configure()` checks the schema: the node appears in some `inputs`, `home` has an input, the secret is long enough, and the binary of a built-in backend exists. On error it logs, shows a macOS notification, and `start()` does nothing.
 
-**`status()`** returns the node name, the peers with their last-seen time, the owner of each display, and whether each display is locally visible.
+**`status()`** returns `{ node, instance, peers, displays }`. `peers[name]` is `{ lastSeen, active, alive }`: the time of the last verified message, the peer's replicated presence (`false` when inactive, `nil` when unknown) and whether it was heard from within 3 heartbeat intervals. `displays[id]` is `{ owner, visible, input }`: the recorded owner, whether this Mac currently sees the monitor, and this node's DDC input.
 
 **Caveat for publishers.** The default `node` is the machine's hostname. Anyone publishing their configuration should set `node` explicitly.
 
@@ -276,7 +277,7 @@ General rule: state is always repairable by the next event. Everything is logged
 | Situation | Handling |
 |---|---|
 | Owner unreachable on claim (off, network down, asleep without release) | Send `request` to the owner. On failure, broadcast `request` to all alive peers: whoever sees the display pushes. At most 5 attempts per claim, with 2, 4, 8, 8 s between them, then log and notify "cannot claim <display>". The node keeps a *claim intent* while active and retries when the owner reappears (`hello`). |
-| Release on `systemWillSleep` (little time) | The backend is called synchronously (`hs.task`, 2 s limit) and `owner = target` is written right after it. The state broadcast is synchronous too (`hs.http.doRequest`, 1 s per peer). Peers that missed it learn via `hello` after wake; meanwhile the broadcast-request fallback covers claims. |
+| Release on `systemWillSleep` (little time) | The backend is called synchronously (`hs.task`, 2 s limit) and `owner = target` is written right after it. The state broadcast is synchronous too: a blocking `hs.http.doRequest` per alive peer, with no timeout of its own (§7.5). Peers that missed it learn via `hello` after wake; meanwhile the broadcast-request fallback covers claims. |
 | Two claims at the same moment | `owner` is decided by LWW. 3 s after a claim that went through `request`, the claimer verifies: if the merged state says `owner ~= self`, another node won — the claim intent is dropped and nothing more is sent. If `owner == self` but the display is still not visible (a "detaching" display showing another input), the claim is retried; this counts towards the 5-attempt limit. Always-visible displays cannot be verified this way (see limitations). |
 | DDC command fails (exit ≠ 0, or 5 s timeout) | One retry after 1 s, then error log and notification. `owner` is not changed. A missing backend binary is detected by `configure()`. |
 | Monitor auto-switches input on no signal | State may be stale. It is fixed by the next claim. Disabling auto input select in the monitor's OSD is recommended. |
@@ -287,7 +288,8 @@ General rule: state is always repairable by the next event. Everything is logged
 | Two nodes with the same name | Every message carries a random `instance`, new on every start. A new instance simply replaces the previous one (that is a reload or restart). A notification is raised only when an **older** instance is heard again after a newer one appeared within `2 × heartbeat` — two live processes are interleaving, which is a configuration error. |
 | Node removed or renamed | Its presence expires after 3 intervals. An owner pointing to an unknown node is treated as unreachable, which triggers the broadcast fallback. |
 | Foreign or invalid requests (other groups, scanners) | 401 without details. Debug-level log, rate-limited. |
-| Start / reload | Send `hello` to all peers, then evaluate sensors: unlocked and idle < `startIdle` → active (claim). Otherwise presence is inactive and ownership is learned from the peers' replies. |
+| Start / reload | The sensors are read first (unlocked and idle < `startIdle` → active, otherwise inactive) and the node's own presence is set; then discovery starts and `hello` is sent to every peer found. If the node is active it then claims. Otherwise ownership is learned from the peers' replies. Static peers are greeted once at start; if a static peer starts later, `hello` is re-sent on the heartbeat until the peer's name is learned, and also as soon as a message arrives from it. |
+| Port already in use | `Transport:start` detects that the server is not listening, logs an error and `start()` shows the notification "DisplayKVM: cannot listen on port <n>". Nothing else is started and no half-started node is kept. |
 | Garbage collection | All watchers, timers and the server are fields of `Node`, held by `spoon.DisplayKVM`. No globals. |
 
 **Documented limitations:**
@@ -312,12 +314,14 @@ General rule: state is always repairable by the next event. Everything is logged
 The **repository root is the Spoon**, so the repo can be cloned directly into `Spoons/DisplayKVM.spoon`.
 
 ```
-init.lua  node.lua  state.lua  policy.lua  activity.lua
-lid.lua   display.lua  transport.lua  discovery.lua
+init.lua  node.lua  state.lua  policy.lua  config.lua  message.lua
+instances.lua  activity.lua  lid.lua  runner.lua  display.lua
+transport.lua  discovery.lua
 backends/            -- m1ddc, ddcctl, betterdisplay, lunar
+tools/               -- build-dist.sh (release zip), gen-docs-json.lua (SpoonInstall metadata)
 spec/                -- busted specs; spec/support/ holds the hs fakes
-docs/                -- design.md (this file), README material
-.github/workflows/   -- CI
+docs/                -- design.md (this file)
+.github/workflows/   -- CI and release
 ```
 
 Install options:
@@ -332,6 +336,6 @@ The repository must never contain secrets, a user's UUIDs or hostnames, or anyth
 Points the first draft left implicit, now decided:
 
 1. **Nonce cache retention.** A nonce is kept for 60 s (the full span in which a message with that timestamp can pass the ±30 s window), then evicted.
-2. **Replies.** Validation failures return 401 with an empty body. Accepted `hello` returns 200 with the receiver's full state as JSON. Accepted `state` returns 204. Accepted `request` returns 200 with `{"result": "ok"}` or `{"result": "failed", "reason": "<short text>"}` (e.g. `not-visible`, `backend-error`).
+2. **Replies.** Validation failures return 401 with an empty body. Accepted `hello` returns 200 with the receiver's full state; accepted `state` returns 204; accepted `request` returns 200 with a result. Replies that carry a body are signed `reply` envelopes (§7.1) with `X-DisplayKVM-Sig`, verified by the requester like any other message, so a reply cannot be forged and also counts as contact with the replying node. The `hello` body is `{"state": ...}`; the `request` body is `{"result": "ok"}` or `{"result": "failed", "reason": "<short text>"}` (e.g. `not-visible`, `backend-error`, `unknown-display`).
 3. **When `owner` is written.** Always after the switch succeeded — for claims and releases alike. On `systemWillSleep` the synchronous backend call returns before sleep, so `owner = target` is written immediately after it; only the broadcast of that change is best-effort.
 4. **Default of `pull`.** The Spoon default stays `true`. A user whose hardware pre-check shows the monitor ignores DDC from an inactive input sets `pull = false` for that display.

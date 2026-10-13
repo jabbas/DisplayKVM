@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -15,8 +19,6 @@ jobs:
       - uses: leafo/gh-actions-lua@v13
         with:
           luaVersion: "5.4"
-      - name: Build
-        run: bash tools/build-dist.sh dist-out
       - name: Check the tag matches obj.version
         run: |
           version="$(grep -m1 '^obj.version' init.lua | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -24,6 +26,15 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match obj.version ${version}" >&2
             exit 1
           fi
+      - uses: leafo/gh-actions-luarocks@v6
+      - name: Install test tools
+        run: luarocks install busted && luarocks install luacheck && luarocks install dkjson
+      - name: Lint
+        run: luacheck .
+      - name: Test
+        run: busted
+      - name: Build
+        run: bash tools/build-dist.sh dist-out
       - name: Publish the dist branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
