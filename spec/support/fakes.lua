@@ -1,1 +1,198 @@
-return {}
+-- Shared test doubles that mirror the Hammerspoon APIs used by the Spoon, so production
+-- code receives them exactly like the real `hs.*` modules. Usage in a spec:
+--   local fakes = dofile("spec/support/fakes.lua")
+--
+-- fakes.timer()                       -- controllable clock + scheduler (mirrors hs.timer)
+--   timer.now()                       -- current fake time in seconds (starts at 0)
+--   timer.doAfter(sec, fn) -> {stop(), running()}
+--   timer.doEvery(sec, fn) -> {stop(), running()}
+--   timer.advance(sec)                -- moves the clock, firing due timers in order
+--   timer.pending() -> number         -- count of live (not stopped, not fired) timers
+--
+-- fakes.task(script, opts)            -- mirrors the hs.task module
+--   script: list of results {code, stdout, stderr}; instance N gets script[N] (default {0, "", ""}).
+--           An entry may also be a function(path, args) returning such a table.
+--   opts.timer, opts.latency: if given, an instance completes `latency` (default 0) seconds after
+--           :start() when the timer is advanced; otherwise the test completes it manually.
+--   task.new(path, callback, args) -> {start(), isRunning(), terminate()}   (task(...) is an alias)
+--   task.created                      -- every instance: {path, args, started, terminated, done}
+--   task.finish([n])                  -- completes instance n (default: oldest started, running one);
+--                                        returns the instance
+--
+-- fakes.host(idle)                    -- mirrors hs.host: host.idleTime() returns host.idle (seconds)
+--
+-- fakes.caffeinate()                  -- mirrors hs.caffeinate
+--   caffeinate.watcher.<name> = number constants, caffeinate.watcher.new(fn) -> {start, stop}
+--   caffeinate.sessionProperties()    -- returns {CGSSessionScreenIsLocked = caffeinate.locked},
+--                                        or nil when caffeinate.noProps is true
+--   caffeinate.emit(name)             -- delivers the named event to the started watcher
+--   caffeinate.watchers               -- all created watchers: {started, stopped}
+--
+-- fakes.screenWatcher()               -- mirrors hs.screen.watcher
+--   screenWatcher.new(fn) -> {start, stop}
+--   screenWatcher.fire()              -- calls the callback of every started watcher
+--   screenWatcher.watchers            -- all created watchers: {started, stopped}
+
+local fakes = {}
+
+function fakes.timer()
+  local timer = { _now = 0, _seq = 0, _entries = {} }
+
+  function timer.now() return timer._now end
+
+  local function schedule(sec, fn, repeating)
+    timer._seq = timer._seq + 1
+    local entry = { due = timer._now + sec, seq = timer._seq, fn = fn, interval = repeating and sec or nil }
+    entry.live = true
+    timer._entries[#timer._entries + 1] = entry
+    return {
+      stop = function() entry.live = false end,
+      running = function() return entry.live end,
+    }
+  end
+
+  function timer.doAfter(sec, fn) return schedule(sec, fn, false) end
+  function timer.doEvery(sec, fn) return schedule(sec, fn, true) end
+
+  function timer.pending()
+    local n = 0
+    for _, e in ipairs(timer._entries) do
+      if e.live then n = n + 1 end
+    end
+    return n
+  end
+
+  local function nextDue(limit)
+    local best
+    for _, e in ipairs(timer._entries) do
+      local earlier = best == nil or e.due < best.due or (e.due == best.due and e.seq < best.seq)
+      if e.live and e.due <= limit and earlier then best = e end
+    end
+    return best
+  end
+
+  function timer.advance(sec)
+    local limit = timer._now + sec
+    while true do
+      local e = nextDue(limit)
+      if e == nil then break end
+      timer._now = e.due
+      if e.interval then
+        e.due = e.due + e.interval
+        timer._seq = timer._seq + 1
+        e.seq = timer._seq
+      else
+        e.live = false
+      end
+      e.fn()
+    end
+    timer._now = limit
+    local kept = {}
+    for _, e in ipairs(timer._entries) do
+      if e.live then kept[#kept + 1] = e end
+    end
+    timer._entries = kept
+  end
+
+  return timer
+end
+
+function fakes.task(script, opts)
+  script = script or {}
+  opts = opts or {}
+  local task = { created = {} }
+
+  local function complete(inst)
+    if inst.done or inst.terminated then return end
+    inst.done = true
+    inst.running = false
+    local r = inst.result
+    inst.callback(r[1], r[2], r[3])
+  end
+
+  function task.new(path, callback, args)
+    local inst = { path = path, args = args, callback = callback, started = false, done = false }
+    task.created[#task.created + 1] = inst
+    local n = #task.created
+    local entry = script[n]
+    if type(entry) == "function" then entry = entry(path, args) end
+    entry = entry or {}
+    inst.result = { entry[1] or 0, entry[2] or "", entry[3] or "" }
+    function inst.start()
+      inst.started = true
+      inst.running = true
+      if opts.timer then opts.timer.doAfter(opts.latency or 0, function() complete(inst) end) end
+      return inst
+    end
+    function inst.isRunning() return inst.running == true end
+    function inst.terminate()
+      inst.terminated = true
+      inst.running = false
+    end
+    return inst
+  end
+
+  function task.finish(n)
+    local inst = n and task.created[n]
+    if n == nil then
+      for _, c in ipairs(task.created) do
+        if c.started and not c.done and not c.terminated then inst = c break end
+      end
+    end
+    assert(inst, "fakes.task: no running instance to finish")
+    complete(inst)
+    return inst
+  end
+
+  return setmetatable(task, { __call = function(_, ...) return task.new(...) end })
+end
+
+function fakes.host(idle)
+  local host = { idle = idle or 0 }
+  function host.idleTime() return host.idle end
+  return host
+end
+
+local function watcherFactory(onFire)
+  local factory = { watchers = {} }
+  function factory.new(fn)
+    local w = { started = false, stopped = false, fn = fn }
+    function w.start() w.started = true w.stopped = false return w end
+    function w.stop() w.started = false w.stopped = true return w end
+    factory.watchers[#factory.watchers + 1] = w
+    return w
+  end
+  function factory.each(...)
+    for _, w in ipairs(factory.watchers) do
+      if w.started then onFire(w, ...) end
+    end
+  end
+  return factory
+end
+
+function fakes.caffeinate()
+  local factory = watcherFactory(function(w, value) w.fn(value) end)
+  local constants = {
+    systemDidWake = 0, systemWillSleep = 1, systemWillPowerOff = 3,
+    screensDidSleep = 6, screensDidWake = 7, screensDidLock = 10, screensDidUnlock = 11,
+  }
+  local watcher = { new = factory.new }
+  for name, value in pairs(constants) do watcher[name] = value end
+  local c = { watcher = watcher, watchers = factory.watchers, locked = false, noProps = false }
+  function c.sessionProperties()
+    if c.noProps then return nil end
+    return { CGSSessionScreenIsLocked = c.locked }
+  end
+  function c.emit(name)
+    assert(constants[name], "unknown caffeinate event " .. tostring(name))
+    factory.each(constants[name])
+  end
+  return c
+end
+
+function fakes.screenWatcher()
+  local factory = watcherFactory(function(w) w.fn() end)
+  return { new = factory.new, watchers = factory.watchers, fire = function() factory.each() end }
+end
+
+return fakes
