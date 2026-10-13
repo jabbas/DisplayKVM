@@ -1,7 +1,7 @@
 # DisplayKVM — design
 
 - **Status:** Approved, 2026-10-12
-- **Scope:** a Hammerspoon Spoon that shares N external monitors between M Macs
+- **Scope:** a Hammerspoon Spoon that shares M external monitors between N Macs
 
 ## 1. Summary
 
@@ -82,7 +82,10 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 | `obj` (`init.lua`) | Public Spoon API: `configure(cfg)`, `start()`, `stop()`, `bindHotkeys(map)`, manual `claim(displayId?)`, `release()`, `status()`, and `DisplayKVM.generateSecret()`. Does no work at load time. | Node |
 | `Node` | Orchestrates: sensor events → Policy decisions → Display/Transport actions, and merges peer state. The only long-lived object (held by `spoon.DisplayKVM`). | all below |
 | `State` (pure) | LWW registers `owner[display] = {node, ts}` and `presence[node] = {active, since, ts}`. `merge(remote)`, serialize/deserialize, deterministic tie-break (ts, then node name). | none |
-| `Policy` (pure) | `onActive(state, cfg, me)` returns the displays to claim. `onInactive(state, cfg, me, now)` returns, for each owned display, a release target: the most recently active other node that is alive and has an input for that display, else home, else keep. Input is state and config, output is an action list. | none |
+| `Policy` (pure) | `onActive(state, cfg, me)` returns every display this node has an input for, regardless of the recorded owner: a claim always switches, because the recorded owner may be stale (the monitor may have changed input on its own, or the node was reloaded). `onInactive(state, cfg, me, alive)` returns, for each owned display, a release target: the most recently active other node that is alive and has an input for that display, else home (if home is not this node), else keep. Input is state and config, output is an action list. | none |
+| `Config` (pure) | Validates and normalises the user configuration, fills defaults. | none |
+| `Message` (pure) | Builds and verifies signed envelopes: HMAC, timestamp window, nonce cache. HMAC, clock, randomness and JSON codec are injected. | none |
+| `Runner` | Runs a command through `hs.task` with a timeout, asynchronously or synchronously. | hs.task, hs.timer |
 | `ActivitySensor` | Turns `hs.caffeinate.watcher`, idle time and lock state into `active` / `inactive` events. See below. | hs.caffeinate, hs.host |
 | `LidSensor` | Reads the lid state with `ioreg -r -k AppleClamshellState -d 1`, run asynchronously, debounced by 1.5 s on `hs.screen.watcher`. Lid closed → inactive. Lid open and unlocked → active. Lid open and locked → wait for unlock. No-op on machines without a lid; disabled by `activity.lid = false`. | hs.screen.watcher, hs.task |
 | `Display` | One configured monitor: match (UUID or name pattern, per node or global), inputs map node → DDC input, home, `pull` flag, backend options. Methods: `visible()`, `switchTo(node, done)` with retry. | Backend |
@@ -97,7 +100,7 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 - `screensDidLock` / `screensDidSleep` / `systemWillSleep` → `inactive`.
 - At start: unlocked and idle time < `startIdle` (30 s) → `active`; otherwise `inactive` with no action.
 
-Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `activity.lua`, `lid.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
+Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `config.lua`, `message.lua`, `activity.lua`, `lid.lua`, `runner.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
 
 ```d2
 direction: right
@@ -139,9 +142,11 @@ Spoon conventions followed: `init.lua` returns `obj` with `name`, `version`, `au
 | `presence[node]` | `active` (bool), `since` (ts), `ts` | only the node itself |
 | `owner[display]` | `node`, `ts` | the claimer (`owner = self`) or the releaser (`owner = target`) |
 
-**Merge:** for each record, the higher `ts` wins. On equal `ts`, the higher node name wins. This makes merge idempotent, commutative and associative, so peers converge regardless of delivery order or duplication.
+**Merge:** for each record, the higher `ts` wins. On equal `ts`, an `owner` record with the higher node name wins; a `presence` record keeps the existing value (it has a single writer, so equal `ts` means the same record). This makes merge idempotent, commutative and associative, so peers converge regardless of delivery order or duplication.
 
-**Local liveness (not replicated):** `lastSeen[node]` is the last time anything was received from that node. A node silent for 3 heartbeat intervals is considered absent and is not a release candidate. Its `presence` record is kept but ignored by Policy.
+**Writer rule:** a node writes its own `presence` with `ts = max(now, previous ts + 1)`, so two writes within the same millisecond (for example active → inactive on a fast lock) cannot collide. `since` changes only on an active/inactive transition; heartbeats resend the record unchanged.
+
+**Local liveness (not replicated):** `lastSeen[node]` is the last time any verified message — a request to this node's server or a signed reply to this node's own request — was received from that node. A node silent for 3 heartbeat intervals is considered absent and is not a release candidate. Its `presence` record is kept but ignored by Policy.
 
 Because every record has a single logical writer, and conflicting `owner` writes are resolved deterministically, the state is always repairable by the next event.
 
@@ -181,12 +186,15 @@ Any failure returns 401 with no details.
 ### 7.4 Claim flow
 
 - If the display is visible locally and `pull ~= false`, switch locally (**pull**).
-- Otherwise send `request` to the owner, who switches the monitor (**push**).
-- `owner = self` is written only after success (backend exit code 0, or the reply `ok`).
+- Otherwise send `request` to the recorded owner if it is alive and not this node; if there is no usable owner, or the owner is unreachable or replies `failed`, broadcast `request` to every alive peer. Whoever sees the display pushes; the first `ok` wins.
+- The pusher writes `owner = <requester>` after its switch succeeded and broadcasts it. The requester writes `owner = self` after `ok` (or after its own pull succeeded). Both records name the same node, so LWW merges them cleanly even if the reply is lost.
+- Each attempt — pull, request, broadcast, or a failed post-switch verification — counts towards the limit of 5 attempts per claim (§10).
 
 ### 7.5 Release flow
 
-The owner always sees the display, because it is showing the owner's input, so a push is reliable. The target is chosen by Policy (D3).
+The owner always sees the display, because it is showing the owner's input, so a push is reliable. The target is chosen by Policy (D3). Releasing to `home` does **not** require home to be alive: if home is off or asleep, the monitor shows "no signal" until someone claims it. This is deliberate — it matches the simple "give it back" behaviour people expect, and the next claim repairs the state.
+
+On `systemWillSleep` both the switch and the state broadcast are synchronous (`hs.http.doRequest`, 1 s per peer), because asynchronous work does not complete before the machine sleeps.
 
 ```d2
 shape: sequence_diagram
@@ -211,7 +219,7 @@ b -> a: "state: presence[B]=inactive, owner[display]=target"
 - **No secret in URLs.** The HMAC provides authentication and integrity.
 - **No encryption.** Messages carry only node names, display names and state, which are not confidential. DisplayKVM is not meant to cross untrusted networks.
 - **LAN only.** The default port is 8765 and is configurable. Bonjour advertises the real port. The server can optionally be bound to one interface with `hs.httpserver:setInterface`.
-- **Bonjour:** service type `_displaykvm._tcp`, service name = node name, TXT record `{v="1", group=<first 8 hex of SHA-256(secret)>}`. Peers of a different group are skipped without revealing the secret.
+- **Bonjour:** service type `_displaykvm._tcp`, TXT record `{v="1", group=<first 8 hex of SHA-256(secret)>, node=<node name>}`. The service name is the node name too, but only for readability: Bonjour may rename it on collision (`laptop (2)`), so peers identify each other by `txt.node`, never by the service name. Peers of a different group are skipped without revealing the secret.
 - **Replay protection:** a 30 s timestamp window plus a nonce cache.
 - **Risk:** the 30 s window needs clocks synced by NTP (the macOS default). Skew is rejected and logged.
 - Requests from other groups and scanners get a bare 401. They are logged at debug level, rate-limited.
@@ -241,10 +249,10 @@ spoon.DisplayKVM:bindHotkeys({ claim = { { "ctrl", "alt", "cmd" }, "M" } })  -- 
 | Field | Required | Default | Meaning |
 |---|---|---|---|
 | `node` | no | `hs.host.localizedName()` | Node name. Must appear in at least one `inputs`. |
-| `secret` | yes | — | At least 32 bytes, hex. `DisplayKVM.generateSecret()` helper. |
+| `secret` | yes | — | 64 hex characters (32 random bytes). `DisplayKVM.generateSecret()` helper. |
 | `backend` | no | `"m1ddc"` | Built-in name or function `(display, input, done)`. |
 | `backendOptions` | no | — | For example `{ path = "/opt/homebrew/bin/m1ddc" }` or `{ inputAlt = true }`. |
-| `displays.<id>.match` | yes | — | A string is a name pattern applied on every node. A table `{node = UUID or name}` disambiguates identical monitors. |
+| `displays.<id>.match` | yes | — | A string is matched on every node: a value in UUID format is compared with the screen UUID, anything else is a plain substring of the screen name (not a Lua pattern). A table `{node = UUID or substring}` disambiguates identical monitors or different UUIDs per node. |
 | `displays.<id>.inputs` | yes | — | `{node = DDC input}`. A node without an entry does not take part in that display. |
 | `displays.<id>.home` | no | first node in `inputs` | Release target when no other node is active. |
 | `displays.<id>.pull` | no | `true` | Set `false` for monitors that ignore DDC from an inactive input. Claims then always `request` the owner. |
@@ -267,16 +275,16 @@ General rule: state is always repairable by the next event. Everything is logged
 
 | Situation | Handling |
 |---|---|
-| Owner unreachable on claim (off, network down, asleep without release) | Send `request` to the owner. On failure, broadcast `request` to all alive peers: whoever sees the display pushes. Retry with 2/4/8 s backoff, at most 5 times, then log and notify "cannot claim <display>". The node keeps a *claim intent* while active and retries when the owner reappears (`hello`). |
-| Release on `systemWillSleep` (little time) | The backend is called synchronously (`hs.task` + `waitUntilExit`, 2 s limit). The state broadcast is best-effort. Peers learn via `hello` after wake. Meanwhile the broadcast-request fallback covers it. |
-| Two claims at the same moment | `owner` is decided by LWW. The loser does not switch. The physical command order may differ, so the new owner checks `visible()` after 3 s. If the display is a "detaching" one (disappears when showing another input) and is not visible, it re-sends `request`. This is not verifiable for always-visible displays (see limitations). |
+| Owner unreachable on claim (off, network down, asleep without release) | Send `request` to the owner. On failure, broadcast `request` to all alive peers: whoever sees the display pushes. At most 5 attempts per claim, with 2, 4, 8, 8 s between them, then log and notify "cannot claim <display>". The node keeps a *claim intent* while active and retries when the owner reappears (`hello`). |
+| Release on `systemWillSleep` (little time) | The backend is called synchronously (`hs.task`, 2 s limit) and `owner = target` is written right after it. The state broadcast is synchronous too (`hs.http.doRequest`, 1 s per peer). Peers that missed it learn via `hello` after wake; meanwhile the broadcast-request fallback covers claims. |
+| Two claims at the same moment | `owner` is decided by LWW. 3 s after a claim that went through `request`, the claimer verifies: if the merged state says `owner ~= self`, another node won — the claim intent is dropped and nothing more is sent. If `owner == self` but the display is still not visible (a "detaching" display showing another input), the claim is retried; this counts towards the 5-attempt limit. Always-visible displays cannot be verified this way (see limitations). |
 | DDC command fails (exit ≠ 0, or 5 s timeout) | One retry after 1 s, then error log and notification. `owner` is not changed. A missing backend binary is detected by `configure()`. |
 | Monitor auto-switches input on no signal | State may be stale. It is fixed by the next claim. Disabling auto input select in the monitor's OSD is recommended. |
 | Laptop in clamshell mode with an external display | Default: lid close = release. Clamshell users set `activity.lid = false`. |
 | No Bonjour/mDNS (VLANs, corporate networks) | Use the static `peers` list. Addresses are re-resolved on every discovery event. |
 | Clock skew > 30 s | The receiver rejects with 401 and logs "clock skew with <peer>". The sender logs an NTP hint on 401. |
 | First start, owner unknown (`owner = nil`) | The claimer pulls if the display is visible, otherwise broadcasts `request`. |
-| Two nodes with the same name | Every message carries a random `instance`. Same name with a different instance is a config error and raises a notification. |
+| Two nodes with the same name | Every message carries a random `instance`, new on every start. A new instance simply replaces the previous one (that is a reload or restart). A notification is raised only when an **older** instance is heard again after a newer one appeared within `2 × heartbeat` — two live processes are interleaving, which is a configuration error. |
 | Node removed or renamed | Its presence expires after 3 intervals. An owner pointing to an unknown node is treated as unreachable, which triggers the broadcast fallback. |
 | Foreign or invalid requests (other groups, scanners) | 401 without details. Debug-level log, rate-limited. |
 | Start / reload | Send `hello` to all peers, then evaluate sensors: unlocked and idle < `startIdle` → active (claim). Otherwise presence is inactive and ownership is learned from the peers' replies. |
