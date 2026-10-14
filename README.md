@@ -219,9 +219,10 @@ luarocks install busted && luarocks install luacheck && luarocks install dkjson
 luacheck . && busted
 ```
 
-`tools/build-dist.sh <out-dir>` builds the release zip and `docs.json`. Pushing a tag `vX.Y.Z` (matching
-`obj.version`) runs the release workflow, which publishes both to the `dist` branch and attaches the zip to a
-GitHub release.
+`tools/build-dist.sh <out-dir>` builds the release zip and `docs.json`. Pushing a tag `X.Y.Z` (no `v`
+prefix; it must equal `obj.version`) runs the release workflow, which publishes both to the `dist` branch and
+attaches the zip to a GitHub release. Release 0.1.0 was tagged `v0.1.0`, before this scheme. See
+[CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ## License
 

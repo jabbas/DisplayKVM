@@ -16,7 +16,7 @@
 --              :switchToSync(node, timeoutSec) -> ok, reason
 --              :cancel() abandons the switches in flight (their done is never called); called by stop()
 --   transport  Transport: :start(onMessage, onSeen) :stop() :send(peer, type, body, cb(ok, reply, status))
---              :sendSync(peer, type, body, timeoutSec) -> ok
+--              :sendSync(peer, type, body[, timeoutSec]) -> ok
 --   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names() :resolve(name)
 --              :unaliased(isAlive) -> static addresses whose node name is not learned yet
 --   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
@@ -35,7 +35,6 @@ local RETRY_DELAYS = { 2, 4, 8, 8 } -- before attempts 2..5
 local VERIFY_DELAY = 3
 local REQUEST_SWITCH_TIMEOUT = 3
 local SLEEP_SWITCH_TIMEOUT = 2
-local SLEEP_SEND_TIMEOUT = 1
 local NOTIFY_INTERVAL_MS = 300000
 local ALIVE_INTERVALS = 3
 local UNALIASED_HELLO_INTERVAL_MS = 5000
@@ -172,7 +171,7 @@ function Node:_broadcastSync()
   end
   table.sort(names)
   for _, name in ipairs(names) do
-    self.transport:sendSync(name, "state", body, SLEEP_SEND_TIMEOUT)
+    self.transport:sendSync(name, "state", body)
   end
 end
 

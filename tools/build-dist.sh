@@ -22,7 +22,7 @@ spoon="$work/DisplayKVM.spoon"
 mkdir -p "$spoon/backends"
 cp "$root"/*.lua "$spoon/"
 cp "$root"/backends/*.lua "$spoon/backends/"
-cp "$root/LICENSE" "$root/README.md" "$spoon/"
+cp "$root/LICENSE" "$root/README.md" "$root/CHANGELOG.md" "$spoon/"
 
 rm -f "$out/DisplayKVM.spoon.zip"
 (cd "$work" && zip -q -X -r "$out/DisplayKVM.spoon.zip" DisplayKVM.spoon)

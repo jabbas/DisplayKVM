@@ -327,7 +327,8 @@ docs/                -- design.md (this file)
 Install options:
 
 - **git:** `git clone <repo URL> ~/.hammerspoon/Spoons/DisplayKVM.spoon`.
-- **SpoonInstall:** SpoonInstall reads `<repo>/raw/<branch>/docs/docs.json` and `<repo>/raw/<branch>/Spoons/DisplayKVM.spoon.zip`. Because `main` holds the Spoon at its root, a CI job triggered by a version tag builds the zip and `docs/docs.json` (using `hs.doc.builder.genJSON`) and commits them to a separate **`dist`** branch laid out as `Spoons/DisplayKVM.spoon.zip` + `docs/docs.json`. Users register the repo in SpoonInstall with `branch = "dist"`. The same zip is attached to the GitHub release.
+- **SpoonInstall:** SpoonInstall reads `<repo>/raw/<branch>/docs/docs.json` and `<repo>/raw/<branch>/Spoons/DisplayKVM.spoon.zip`. Because `main` holds the Spoon at its root, a CI job triggered by a version tag builds the zip and `docs/docs.json` (generated from the header of `init.lua` by `tools/gen-docs-json.lua`, not by `hs.doc.builder.genJSON`) and commits them to a separate **`dist`** branch laid out as `Spoons/DisplayKVM.spoon.zip` + `docs/docs.json`. Users register the repo in SpoonInstall with `branch = "dist"`. The same zip is attached to the GitHub release.
+- **Release tags** are plain `X.Y.Z` without a `v` prefix (the workflow triggers on `[0-9]+.[0-9]+.[0-9]+`), and the tag must equal `obj.version` in `init.lua` exactly; the workflow fails otherwise. Only 0.1.0 was tagged `v0.1.0`, before this scheme. Changes are listed in `CHANGELOG.md`, which ships in the zip.
 
 The repository must never contain secrets, a user's UUIDs or hostnames, or anything else specific to one setup. Examples use placeholders.
 
