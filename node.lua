@@ -14,6 +14,7 @@
 --   instance   string, random per start, reported by status()
 --   displays   {[id] = Display}: .id .pull :inputFor(node) :visible() :switchTo(node, done(ok, reason))
 --              :switchToSync(node, timeoutSec) -> ok, reason
+--              :cancel() abandons the switches in flight (their done is never called); called by stop()
 --   transport  Transport: :start(onMessage, onSeen) :stop() :send(peer, type, body, cb(ok, reply, status))
 --              :sendSync(peer, type, body, timeoutSec) -> ok
 --   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names() :resolve(name)
@@ -553,6 +554,8 @@ function Node:stop()
   self.running = false
   if self.heartbeat then self.heartbeat:stop() self.heartbeat = nil end
   self:_cancelIntents()
+  for _, display in pairs(self.displays) do display:cancel() end
+  self.releasing = {}
   self.activity:stop()
   if self.lid then self.lid:stop() end
   self.discovery:stop()

@@ -18,9 +18,19 @@ local function failureOutput(stdout, stderr)
 end
 
 -- Async: done(ok, output) is called exactly once, with (false, "timeout") when the limit is hit.
+-- Returns a handle: handle.cancel() terminates the task and drops the pending timeout, and `done`
+-- is not called afterwards (idempotent; a no-op once the task has finished).
 function Runner:run(path, args, timeoutSec, done)
   local finished = false
-  local timeout
+  local timeout, instance
+  local handle = {
+    cancel = function()
+      if finished then return end
+      finished = true
+      if timeout then timeout:stop() end
+      if instance then pcall(function() instance:terminate() end) end
+    end,
+  }
 
   local function finish(ok, output)
     if finished then return end
@@ -29,30 +39,32 @@ function Runner:run(path, args, timeoutSec, done)
     done(ok, output)
   end
 
-  local created, instance = pcall(self.task.new, path, function(code, stdout, stderr)
+  local created, task = pcall(self.task.new, path, function(code, stdout, stderr)
     if code == 0 then
       finish(true, stdout or "")
     else
       finish(false, failureOutput(stdout, stderr))
     end
   end, args)
-  if not created or instance == nil then
+  if not created or task == nil then
     finish(false, "start-failed")
-    return
+    return handle
   end
+  instance = task
 
   local started = pcall(function() instance:start() end)
   if not started then
     finish(false, "start-failed")
-    return
+    return handle
   end
 
-  if finished then return end
+  if finished then return handle end
   timeout = self.timer.doAfter(timeoutSec, function()
     if finished then return end
     finish(false, "timeout")
     instance:terminate()
   end)
+  return handle
 end
 
 -- Blocking variant for the sleep path: polls until the task ends or the limit expires.

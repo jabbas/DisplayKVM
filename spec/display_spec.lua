@@ -231,6 +231,116 @@ describe("Display", function()
     end)
   end)
 
+  describe("cancel", function()
+    it("stops the retry timer: no second attempt and no done after cancel", function()
+      local d = build(spec(UUID_A), { { 1, "", "err" }, { 0, "", "" } })
+      d:switchTo("laptop", record())
+      timer.advance(0) -- the first attempt failed, the retry is waiting
+      d:cancel()
+      timer.advance(10)
+      assert.equals(1, #task.created)
+      assert.same({}, results)
+      assert.equals(0, timer.pending())
+    end)
+
+    it("terminates the task in flight without calling done", function()
+      local d = build(spec(UUID_A), { { 0, "", "" } }, 100)
+      d:switchTo("laptop", record())
+      assert.is_true(task.created[1].running)
+      d:cancel()
+      assert.is_true(task.created[1].terminated)
+      timer.advance(200)
+      assert.equals(1, #task.created)
+      assert.same({}, results)
+      assert.equals(0, timer.pending())
+    end)
+
+    it("does not call done when a function backend answers late", function()
+      local late
+      backend = function(_, _, done) late = done end
+      local d = build(spec(UUID_B))
+      d:switchTo("laptop", record())
+      d:cancel()
+      late(true)
+      assert.same({}, results)
+    end)
+
+    it("does not retry a function backend that failed before the cancel", function()
+      local calls = 0
+      backend = function(_, _, done) calls = calls + 1 done(false) end
+      local d = build(spec(UUID_B))
+      d:switchTo("laptop", record())
+      d:cancel()
+      timer.advance(5)
+      assert.equals(1, calls)
+      assert.same({}, results)
+    end)
+
+    it("cancels every switch in flight and leaves the display usable", function()
+      local d = build(spec(UUID_A), {}, 1)
+      d:switchTo("laptop", record())
+      d:switchTo("desk-mini", record())
+      d:cancel()
+      assert.is_true(task.created[1].terminated)
+      assert.is_true(task.created[2].terminated)
+      d:switchTo("laptop", record())
+      timer.advance(1)
+      assert.same({ { true } }, results)
+    end)
+
+    it("does nothing when nothing is pending", function()
+      local d = build(spec(UUID_A))
+      d:cancel()
+      d:switchTo("laptop", record())
+      timer.advance(0)
+      assert.same({ { true } }, results)
+    end)
+  end)
+
+  describe("function backends that raise", function()
+    it("treats an error in switchTo as a failed attempt, retries once, then reports backend-error", function()
+      local calls, errors = 0, {}
+      logger = { e = function(msg) errors[#errors + 1] = msg end }
+      backend = function() calls = calls + 1 error("boom") end
+      local d = build(spec(UUID_B))
+      d:switchTo("laptop", record())
+      assert.equals(1, calls)
+      assert.same({}, results)
+      timer.advance(1)
+      assert.equals(2, calls)
+      assert.same({ { false, "backend-error" } }, results)
+      assert.equals(2, #errors)
+      assert.matches("boom", errors[1])
+    end)
+
+    it("succeeds when the retry after an error succeeds", function()
+      local calls = 0
+      backend = function(_, _, done)
+        calls = calls + 1
+        if calls == 1 then error("first") end
+        done(true)
+      end
+      local d = build(spec(UUID_B))
+      d:switchTo("laptop", record())
+      timer.advance(1)
+      assert.same({ { true } }, results)
+    end)
+
+    it("treats an error in switchToSync as backend-error", function()
+      backend = function() error("boom") end
+      local ok, reason = build(spec(UUID_B)):switchToSync("laptop", 3)
+      assert.is_false(ok)
+      assert.equals("backend-error", reason)
+    end)
+
+    it("does not need a logger", function()
+      backend = function() error("boom") end
+      local ok, reason = build(spec(UUID_B)):switchToSync("laptop", 3)
+      assert.is_false(ok)
+      assert.equals("backend-error", reason)
+    end)
+  end)
+
   describe("switchToSync", function()
     it("runs the backend once and returns true on success", function()
       local d = build(spec(UUID_A), { { 0, "", "" } }, 0.1)

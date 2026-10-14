@@ -31,7 +31,7 @@
 --   (the old one keeps running when keepOld is set, so it can be heard again).
 -- Observation: sim:input(), sim:owner(viewer), sim:presence(viewer, name), sim:node(name), sim:state(name),
 --   sim.monitor (commands, applied, stuck, failing), sim.counts[name] = {switchTo, switchToSync, sendSync,
---   broadcastSync}, sim.messages (every send), sim:sent{from=,to=,type=}, sim.notifications,
+--   broadcastSync, cancel}, sim.messages (every send), sim:sent{from=,to=,type=}, sim.notifications,
 --   sim:notified(kind, node).
 
 local fakes = dofile("spec/support/fakes.lua")
@@ -106,6 +106,8 @@ local function newDisplay(sim, node, id, spec)
       if ok then done(true) else done(false, "backend-error") end
     end)
   end
+
+  function d:cancel() counts.cancel = counts.cancel + 1 end
 
   function d:switchToSync(target, _)
     counts.switchToSync = counts.switchToSync + 1
@@ -350,7 +352,7 @@ function Sim.new(opts)
   self.instanceCounter = 0
   for _, name in ipairs(self.names) do
     self.sensors[name] = { locked = true, idle = 1000, closed = false }
-    self.counts[name] = { switchTo = 0, switchToSync = 0, sendSync = 0, broadcastSync = 0 }
+    self.counts[name] = { switchTo = 0, switchToSync = 0, sendSync = 0, broadcastSync = 0, cancel = 0 }
     self:_build(name)
   end
   return self

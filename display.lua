@@ -19,6 +19,7 @@ function Display.new(id, spec, me, deps)
     _match = spec.match,
     _me = me,
     _deps = deps,
+    _ops = {}, -- switchTo calls in flight (retry timer and runner task), see cancel()
   }, Display)
 end
 
@@ -59,8 +60,14 @@ function Display:_attempt(node)
 
   local backend = self._deps.backend
   if type(backend) == "function" then
+    -- A raising user function is a failed attempt, not a crash of the caller.
     return function(done)
-      backend({ id = self.id, uuid = target.uuid, name = target.name }, input, done)
+      local ok, err = pcall(backend, { id = self.id, uuid = target.uuid, name = target.name }, input, done)
+      if not ok then
+        local log = self._deps.log
+        if log and log.e then log.e("backend function failed: " .. tostring(err)) end
+        done(false)
+      end
     end
   end
 
@@ -73,6 +80,7 @@ function Display:_attempt(node)
   end
 end
 
+-- Calls done(true) or done(false, reason) once, unless cancel() runs first: then done is never called.
 function Display:switchTo(node, done)
   local attempt, reason = self:_attempt(node)
   if attempt == nil then
@@ -81,21 +89,47 @@ function Display:switchTo(node, done)
   end
 
   local deps = self._deps
+  local op = {}
+  self._ops[op] = true
+
+  local function finish(ok, why)
+    self._ops[op] = nil
+    if op.cancelled then return end
+    done(ok, why)
+  end
+
   local function try(retriesLeft)
+    if op.cancelled then return end
     local settled = false
-    attempt(function(ok)
-      if settled then return end
+    op.handle = attempt(function(ok)
+      if settled or op.cancelled then return end
       settled = true
+      op.handle = nil
       if ok then
-        done(true)
+        finish(true)
       elseif retriesLeft > 0 then
-        deps.timer.doAfter(RETRY_DELAY, function() try(retriesLeft - 1) end)
+        op.timer = deps.timer.doAfter(RETRY_DELAY, function()
+          op.timer = nil
+          try(retriesLeft - 1)
+        end)
       else
-        done(false, "backend-error")
+        finish(false, "backend-error")
       end
     end, deps.runner, false)
   end
   try(1)
+end
+
+-- Abandons every switchTo in flight: stops the retry timers and terminates the running tasks.
+-- The callers' `done` functions are not called afterwards.
+function Display:cancel()
+  local ops = self._ops
+  self._ops = {}
+  for op in pairs(ops) do
+    op.cancelled = true
+    if op.timer then op.timer:stop() op.timer = nil end
+    if op.handle then op.handle.cancel() op.handle = nil end
+  end
 end
 
 function Display:switchToSync(node, timeoutSec)

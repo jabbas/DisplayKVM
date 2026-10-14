@@ -60,6 +60,24 @@ describe("Runner", function()
       assert.same({ { false, "timeout" } }, calls)
     end)
 
+    it("returns a handle whose cancel terminates the task and silences done and the timeout", function()
+      build({ { 0, "late", "" } }, 10)
+      local calls = {}
+      local handle = runner:run("/bin/x", {}, 5, function(ok, out) calls[#calls + 1] = { ok, out } end)
+      handle.cancel()
+      assert.is_true(task.created[1].terminated)
+      timer.advance(20)
+      assert.same({}, calls)
+      handle.cancel() -- idempotent
+    end)
+
+    it("returns a harmless handle for a task that cannot be started", function()
+      build({}, 0)
+      task.new = function() error("no such file") end
+      local handle = runner:run("/bin/x", {}, 5, function() end)
+      handle.cancel()
+    end)
+
     it("cancels the timeout timer once the task has finished", function()
       build({ { 0, "", "" } }, 0)
       runner:run("/bin/x", {}, 5, function() end)
