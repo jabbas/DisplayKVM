@@ -392,11 +392,13 @@ function Node:_onInactive(reason, sync)
   local targets = self.policy.onInactive(self.state, self.cfg, self.me, alive)
   if sync then
     for _, t in ipairs(targets) do
+      -- Runs even when an async release of the same display is in flight: the switch to the same target
+      -- is idempotent and the async one may be suspended by the sleep.
       local ok, why = self.displays[t.display]:switchToSync(t.target, SLEEP_SWITCH_TIMEOUT)
       if ok then
         self:_writeOwner(t.display, t.target)
       else
-        self.log.e("release of " .. t.display .. " failed: " .. tostring(why))
+        self:_releaseFailed(t.display, why)
       end
     end
     self:_broadcastSync()
@@ -407,18 +409,31 @@ function Node:_onInactive(reason, sync)
   self:_releaseAsync(targets)
 end
 
--- Async release of {display, target} pairs. When the switch lands the situation may have changed:
--- the node may be active again (claim afresh, the monitor now shows the target) or a peer may have
--- taken the display meanwhile (leave its owner record alone).
+-- A failed release is only an error when the monitor still shows this node. `not-visible` means it
+-- already shows another input, and a backend failure on a display that has meanwhile disappeared means
+-- another release (for example the sync one on sleep) got there first. The owner is left alone.
+function Node:_releaseFailed(id, why)
+  if why == "not-visible" or (why == "backend-error" and not self.displays[id]:visible()) then
+    return self.log.i(id .. " already handed over (release: " .. tostring(why) .. ")")
+  end
+  self.log.e("release of " .. id .. " failed: " .. tostring(why))
+end
+
+-- Async release of {display, target} pairs. At most one per display is in flight; a second inactivity
+-- event meanwhile (lock, then sleep or lid close) adds nothing. When the switch lands the situation
+-- may have changed: the node may be active again (claim afresh, the monitor now shows the target) or a
+-- peer may have taken the display meanwhile (leave its owner record alone).
 function Node:_releaseAsync(targets)
   for _, t in ipairs(targets) do
     local id = t.display
-    if not self.releasing[id] then
+    if self.releasing[id] then
+      self.log.d("release of " .. id .. " already in flight")
+    else
       self.releasing[id] = true
       self.displays[id]:switchTo(t.target, function(ok, why)
         self.releasing[id] = nil
         if not self.running then return end
-        if not ok then return self.log.e("release of " .. id .. " failed: " .. tostring(why)) end
+        if not ok then return self:_releaseFailed(id, why) end
         if self.active then return self:_startClaim(id) end
         if self.state:owner(id) ~= self.me then
           return self.log.i("release of " .. id .. " landed but " .. tostring(self.state:owner(id)) .. " owns it now")

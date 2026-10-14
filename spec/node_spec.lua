@@ -416,6 +416,114 @@ describe("Node scenarios", function()
     end)
   end)
 
+  describe("consecutive inactivity events", function()
+    local function logs(sim, node, level)
+      local out = {}
+      for _, line in ipairs(sim.logLines) do
+        local who, lvl, msg = line:match("^(%S+) (%a) (.*)$")
+        if who == node and lvl == level then out[#out + 1] = msg end
+      end
+      return out
+    end
+
+    local function matching(lines, pattern)
+      local n = 0
+      for _, line in ipairs(lines) do
+        if line:find(pattern, 1, true) then n = n + 1 end
+      end
+      return n
+    end
+
+    local function activeLaptop(o)
+      local sim = make(o)
+      sim:activate("laptop")
+      sim:advance(1)
+      assert.equal(16, sim:input())
+      return sim, sim.counts.laptop.switchTo, sim.monitor.applied
+    end
+
+    it("A1 a lock followed at once by a sleep starts one async release and logs no error", function()
+      local sim, switches = activeLaptop()
+      sim:lock("laptop")
+      sim:sleep("laptop") -- the async release is still in flight
+      sim:advance(5)
+      assert.equal(switches + 1, sim.counts.laptop.switchTo)
+      assert.equal(15, sim:input())
+      assert.same({}, logs(sim, "laptop", "e"))
+      allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    end)
+
+    it("A2 a lid close followed by a lock starts one async release and logs no error", function()
+      local sim, switches = activeLaptop({ lid = true })
+      sim:lid("laptop", true)
+      sim:lock("laptop")
+      sim:advance(5)
+      assert.equal(switches + 1, sim.counts.laptop.switchTo)
+      assert.equal(15, sim:input())
+      assert.same({}, logs(sim, "laptop", "e"))
+      assert.equal(1, matching(logs(sim, "laptop", "d"), "in flight"))
+      allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    end)
+
+    it("A3 a sleep after the async release has landed does nothing more", function()
+      local sim, _, applied = activeLaptop()
+      sim:lock("laptop")
+      sim:advance(1)
+      assert.equal(15, sim:input())
+      sim:sleep("laptop")
+      sim:advance(5)
+      assert.equal(applied + 1, sim.monitor.applied)
+      assert.equal(15, sim:input())
+      assert.same({}, logs(sim, "laptop", "e"))
+      allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    end)
+
+    it("A4 a second async inactivity event after the release landed does nothing more", function()
+      local sim, _, applied = activeLaptop()
+      sim:lock("laptop")
+      sim:advance(1)
+      sim:lock("laptop")
+      sim:advance(5)
+      assert.equal(applied + 1, sim.monitor.applied)
+      assert.same({}, logs(sim, "laptop", "e"))
+    end)
+
+    it("A5 a release that finds the display not visible logs info and keeps the owner", function()
+      local sim = activeLaptop()
+      sim.monitor.input = 15 -- the monitor was switched away behind the laptop's back
+      sim:lock("laptop")
+      sim:advance(5)
+      assert.same({}, logs(sim, "laptop", "e"))
+      assert.equal(1, matching(logs(sim, "laptop", "i"), "already handed over"))
+      assert.equal("laptop", sim:owner("laptop"))
+    end)
+
+    it("A6 a sync release that finds the display not visible logs info and keeps the owner", function()
+      local sim = activeLaptop()
+      sim.monitor.input = 15
+      sim:sleep("laptop")
+      assert.same({}, logs(sim, "laptop", "e"))
+      assert.equal(1, matching(logs(sim, "laptop", "i"), "already handed over"))
+      assert.equal("laptop", sim:owner("laptop"))
+    end)
+
+    it("A7 a backend error on a display that is still visible stays an error", function()
+      local sim = activeLaptop()
+      sim.monitor.failing = true
+      sim:lock("laptop")
+      sim:advance(5)
+      assert.equal(1, matching(logs(sim, "laptop", "e"), "release of left failed: backend-error"))
+      assert.equal(0, matching(logs(sim, "laptop", "i"), "already handed over"))
+    end)
+
+    it("A8 a sync backend error stays an error", function()
+      local sim = activeLaptop()
+      sim.monitor.failing = true
+      sim:sleep("laptop")
+      assert.equal(1, matching(logs(sim, "laptop", "e"), "release of left failed: backend-error"))
+    end)
+  end)
+
   it("S16 releasing to a home that is not alive still switches and records the owner", function()
     local sim = make()
     sim:activate("laptop")
