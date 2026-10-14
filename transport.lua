@@ -108,7 +108,7 @@ end
 -- Returns url, raw, headers for a message to `peerName`, or nil when the peer is unknown.
 function Transport:_prepare(peerName, msgType, body)
   local addr = self.discovery:resolve(peerName)
-  if not addr then return nil end
+  if not addr or addr.host == nil or addr.port == nil then return nil end
   local raw, sig = self.message:build(msgType, body)
   local url = "http://" .. addr.host .. ":" .. addr.port .. PATH
   return url, raw, { ["Content-Type"] = "application/json", [SIG_HEADER] = sig }

@@ -162,6 +162,35 @@ describe("Discovery", function()
       assert.is_truthy(entries[1]:find("timeout", 1, true))
     end)
 
+    it("skips a resolved service without a hostname or port and logs it at debug level", function()
+      local entries = {}
+      d = make({ log = { d = function(m) entries[#entries + 1] = m end } })
+      start()
+      local noHost = remote("a", "a")
+      noHost.hostname = function() return nil end
+      local noPort = remote("b", "b")
+      noPort.port = function() return nil end
+      bonjour.browsers[2].add(noHost)
+      bonjour.browsers[2].add(noPort)
+      assert.are.same({}, up)
+      assert.are.same({}, d:names())
+      assert.is_nil(d:resolve("a"))
+      assert.is_nil(d:resolve("b"))
+      assert.are.equal(2, #entries)
+      assert.is_truthy(entries[1]:find("hostname", 1, true))
+      local good = remote("laptop", "laptop")
+      bonjour.browsers[2].add(good)
+      assert.are.same({ "laptop" }, up)
+    end)
+
+    it("does not report a peer down for a skipped service that is removed", function()
+      local noHost = remote("a", "a")
+      noHost.hostname = function() return nil end
+      bonjour.browsers[1].add(noHost)
+      bonjour.browsers[1].remove(noHost)
+      assert.are.same({}, down)
+    end)
+
     it("accepts a peer whose resolution completes later", function()
       local svc = remote("laptop", "laptop", { result = false })
       bonjour.browsers[1].add(svc)

@@ -282,6 +282,19 @@ describe("Transport", function()
       assert.are.same({ x = 1 }, msg.body)
     end)
 
+    it("fails with unknown-peer when the resolved peer has no host or port", function()
+      discovery.peers["nohost"] = { port = 8765 }
+      discovery.peers["noport"] = { host = "x.local." }
+      for _, name in ipairs({ "nohost", "noport" }) do
+        local r = result()
+        t:send(name, "state", {}, r.cb)
+        assert.is_false(r.ok)
+        assert.are.equal("unknown-peer", r.status)
+        assert.are.equal(1, r.calls)
+      end
+      assert.are.equal(0, #http.posts)
+    end)
+
     it("fails with unknown-peer without posting", function()
       local r = result()
       t:send("studio", "state", {}, r.cb)
@@ -482,6 +495,15 @@ describe("Transport", function()
       assert.is_false(t:sendSync("laptop", "state", {}, 1))
       http.sync = function() return -1, "refused", {} end
       assert.is_false(t:sendSync("laptop", "state", {}, 1))
+    end)
+
+    it("returns false without a request or a log entry when the peer has no host or port", function()
+      discovery.peers["nohost"] = { port = 8765 }
+      discovery.peers["noport"] = { host = "x.local." }
+      assert.is_false(t:sendSync("nohost", "state", {}, 1))
+      assert.is_false(t:sendSync("noport", "state", {}, 1))
+      assert.are.equal(0, #http.requests)
+      assert.are.equal(0, logs.count("d", "sync send"))
     end)
 
     it("returns false for an unknown peer without a request", function()

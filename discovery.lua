@@ -57,8 +57,13 @@ function Discovery:_onResolved(svc, onUp)
   end
   local node = txt.node
   if node == self.node then return end
+  local host, port = svc:hostname(), svc:port()
+  if host == nil or port == nil then
+    self.log.d("ignoring service " .. tostring(svc:name()) .. ": resolved without hostname or port")
+    return
+  end
   local known = self.peers[node] ~= nil
-  self.peers[node] = { host = svc:hostname(), port = svc:port() }
+  self.peers[node] = { host = host, port = port }
   self.services[svc:name()] = node
   if not known then onUp(node) end
 end
