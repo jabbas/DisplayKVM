@@ -6,12 +6,13 @@ Message.__index = Message
 
 local VERSION = 1
 
--- Compares two strings without leaving early on the first differing byte.
+-- Compares two strings without leaving early on the first differing byte: no branch in the loop
+-- depends on the data. A length mismatch may return at once (the length is not secret).
 function Message.constantTimeEqual(a, b)
   if type(a) ~= "string" or type(b) ~= "string" or #a ~= #b then return false end
   local diff = 0
   for i = 1, #a do
-    if a:byte(i) ~= b:byte(i) then diff = diff + 1 end
+    diff = diff | (string.byte(a, i) ~ string.byte(b, i))
   end
   return diff == 0
 end
@@ -27,19 +28,23 @@ function Message.new(deps)
   self.random = deps.random
   self.codec = deps.codec
   self.window = deps.window or 30000
-  self.nonceTtl = deps.nonceTtl or 60000
+  self.nonceTtl = deps.nonceTtl or 2 * self.window
+  -- A nonce must outlive every timestamp that can still pass the +-window check, i.e. 2 * window.
+  assert(self.nonceTtl >= 2 * self.window,
+    string.format("nonceTtl (%s ms) must be at least 2 * window (%s ms)",
+      tostring(self.nonceTtl), tostring(self.window)))
   self.nonces = {} -- nonce -> expiry (ms)
   return self
 end
 
-function Message:build(type, body)
+function Message:build(msgType, body)
   local raw = self.codec.encode({
     v = VERSION,
     from = self.node,
     instance = self.instance,
     ts = self.now(),
     nonce = self.random(16),
-    type = type,
+    type = msgType,
     body = body,
   })
   return raw, self._sign(raw)
@@ -65,11 +70,14 @@ function Message:verify(raw, sig)
   if not ok or type(msg) ~= "table" or msg.v ~= VERSION
     or type(msg.from) ~= "string" or type(msg.instance) ~= "string"
     or type(msg.ts) ~= "number" or type(msg.nonce) ~= "string"
-    or type(msg.type) ~= "string" or type(msg.body) ~= "table" then
+    or type(msg.type) ~= "string" or type(msg.body) ~= "table"
+    or msg.ts ~= msg.ts or msg.ts == math.huge or msg.ts == -math.huge then
     return nil, "malformed"
   end
 
-  if math.abs(now - msg.ts) > self.window then return nil, "stale", msg.from end
+  -- Floating point: an integer difference could wrap around (math.abs(math.mininteger) is negative).
+  local delta = (now + 0.0) - msg.ts
+  if delta > self.window or delta < -self.window then return nil, "stale", msg.from end
   if self.nonces[msg.nonce] ~= nil then return nil, "replay" end
   if msg.from == self.node then return nil, "self" end
 

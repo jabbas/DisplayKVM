@@ -210,6 +210,97 @@ describe("Message", function()
     end)
   end)
 
+  describe("time window hardening", function()
+    -- A verifier whose codec yields an envelope with exactly the given ts, however unusual.
+    local function verifyTs(ts)
+      local m = Message.new({
+        secret = "s", node = "laptop", instance = "i", hmac = hmac,
+        now = function() return clock end, random = function() return "0" end,
+        codec = {
+          encode = json.encode,
+          decode = function()
+            return { v = 1, from = "desk-mini", instance = "i", ts = ts, nonce = "n", type = "state", body = {} }
+          end,
+        },
+      })
+      return m:verify("x", hmac("s", "x"))
+    end
+
+    it("accepts exactly now - 30000 and now + 30000", function()
+      assert.is_table((verifyTs(clock - 30000)))
+      assert.is_table((verifyTs(clock + 30000)))
+      assert.is_table((verifyTs(clock - 30000.0)))
+      assert.is_table((verifyTs(clock + 30000.0)))
+    end)
+
+    it("rejects one millisecond beyond the window as stale", function()
+      for _, ts in ipairs({ clock - 30001, clock + 30001, clock - 30000.5, clock + 30000.5 }) do
+        local msg, reason, from = verifyTs(ts)
+        assert.is_nil(msg)
+        assert.are.equal("stale", reason, tostring(ts))
+        assert.are.equal("desk-mini", from)
+      end
+    end)
+
+    it("rejects NaN and infinite timestamps as malformed", function()
+      for _, ts in ipairs({ 0 / 0, math.huge, -math.huge }) do
+        local msg, reason = verifyTs(ts)
+        assert.is_nil(msg)
+        assert.are.equal("malformed", reason, tostring(ts))
+      end
+    end)
+
+    it("rejects huge timestamps as stale", function()
+      for _, ts in ipairs({ 1e300, -1e300, math.maxinteger, math.mininteger }) do
+        local msg, reason = verifyTs(ts)
+        assert.is_nil(msg)
+        assert.are.equal("stale", reason, tostring(ts))
+      end
+    end)
+
+    it("rejects the integer whose difference to now wraps to math.mininteger", function()
+      local msg, reason = verifyTs(math.mininteger + clock)
+      assert.is_nil(msg)
+      assert.are.equal("stale", reason)
+    end)
+
+    it("does not remember the nonce of a rejected timestamp", function()
+      local m = laptop
+      local raw = json.encode({ v = 1, from = "desk-mini", instance = "i", ts = clock + 99999, nonce = "n",
+        type = "state", body = {} })
+      assert.is_nil((m:verify(raw, hmac("shared-secret", raw))))
+      assert.are.equal(0, m:_nonceCount())
+    end)
+  end)
+
+  describe("new", function()
+    local function new(extra)
+      local deps = {
+        secret = "s", node = "a", instance = "i", hmac = hmac,
+        now = function() return clock end, random = function() return "0" end,
+        codec = { encode = json.encode, decode = json.decode },
+      }
+      for k, v in pairs(extra) do deps[k] = v end
+      return Message.new(deps)
+    end
+
+    it("requires nonceTtl to be at least twice the window and names both in the error", function()
+      local ok, err = pcall(new, { window = 30000, nonceTtl = 59999 })
+      assert.is_false(ok)
+      assert.matches("nonceTtl", err)
+      assert.matches("window", err)
+      assert.matches("59999", err)
+      assert.matches("30000", err)
+      assert.is_true((pcall(new, { window = 30000, nonceTtl = 60000 })))
+      assert.is_true((pcall(new, { window = 1000, nonceTtl = 5000 })))
+    end)
+
+    it("derives the default nonceTtl from a custom window", function()
+      assert.is_true((pcall(new, { window = 50000 })))
+      assert.is_true((pcall(new, {})))
+    end)
+  end)
+
   describe("constantTimeEqual", function()
     it("compares strings", function()
       assert.is_true(Message.constantTimeEqual("abc", "abc"))
@@ -217,6 +308,9 @@ describe("Message", function()
       assert.is_false(Message.constantTimeEqual("abc", "ab"))
       assert.is_false(Message.constantTimeEqual("ab", "abc"))
       assert.is_true(Message.constantTimeEqual("", ""))
+      assert.is_false(Message.constantTimeEqual("\0abc", "\0abd"))
+      assert.is_false(Message.constantTimeEqual("\255", "\0"))
+      assert.is_true(Message.constantTimeEqual("\255\0\128", "\255\0\128"))
     end)
 
     it("returns false for non-strings", function()
