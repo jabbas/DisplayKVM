@@ -24,7 +24,8 @@
 -- DDC: sim.ddcLatency (seconds, default 0.1) is how long an async switchTo takes; sim.ddcApply = "end"
 --   (default) applies the command when it completes, "start" applies it at once and only reports later.
 -- Clock: one shared fakes.timer(); sim.now() is BASE + fake seconds, in integer ms.
--- Sensors (per node name, survive restarts): sim:setLocked(name, bool), sim:setIdle(name, sec) before
+-- Sensors (per node name, survive restarts): sim:setLocked(name, bool), sim:setIdle(name, sec),
+--   sim:setClosed(name, bool) (the lid is only known 0.05 s after start, like the real sensor) before
 --   sim:start; sim:activate / lock / sleep (systemWillSleep, sync) / lid(name, closed) fire events.
 -- Network: sim:partition(name, bool); sim:hello(name) makes `name` greet every started peer, like a
 --   fresh Bonjour announcement; sim:restart(name, {keepOld = true}) starts a new instance of the node
@@ -43,6 +44,7 @@ local Node = dofile("node.lua")
 local BASE = 1760000000000
 local SOFT_TIMEOUT = 5
 local DDC_LATENCY = 0.1
+local LID_READ_LATENCY = 0.05
 
 local Sim = {}
 Sim.__index = Sim
@@ -291,10 +293,22 @@ function Sim:_build(name)
     return false, "start (idle)"
   end
 
+  -- Like the real sensor: the state is unknown (nil) until the first async read completes, which then
+  -- calls onReady(closed).
   local lid = {}
-  function lid.start(_, onChange) entry.onLid = onChange end
+  function lid.start(_, onChange, onReady)
+    entry.onLid, entry.lidKnown = onChange, false
+    self.timer.doAfter(LID_READ_LATENCY, function()
+      if entry.onLid ~= onChange then return end
+      entry.lidKnown = true
+      if onReady then onReady(sensors.closed) end
+    end)
+  end
   function lid.stop() entry.onLid = nil end
-  function lid.closed() return sensors.closed end
+  function lid.closed()
+    if entry.lidKnown then return sensors.closed end
+    return nil
+  end
 
   local log = {}
   for _, level in ipairs({ "d", "i", "w", "e" }) do
@@ -397,6 +411,7 @@ function Sim:presence(viewer, name) return self.entries[viewer].state:presence(n
 function Sim:partition(name, on) self.partitioned[name] = on end
 function Sim:setLocked(name, locked) self.sensors[name].locked = locked end
 function Sim:setIdle(name, sec) self.sensors[name].idle = sec end
+function Sim:setClosed(name, closed) self.sensors[name].closed = closed end
 
 function Sim:activate(name)
   local s = self.sensors[name]

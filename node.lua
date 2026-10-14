@@ -20,7 +20,8 @@
 --   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names() :resolve(name)
 --              :unaliased(isAlive) -> static addresses whose node name is not learned yet
 --   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
---   lid        optional LidSensor: :start(onChange(closed)) :stop() :closed(); used only if cfg.activity.lid
+--   lid        optional LidSensor: :start(onChange(closed), onReady(closed|nil)) :stop() :closed(); used only if
+--              cfg.activity.lid. onReady fires once, after the asynchronous first read of the lid state
 --   now        function() -> integer milliseconds (also the clock for State timestamps)
 --   timer      hs.timer-like: doAfter(sec, fn), doEvery(sec, fn), both returning an object with :stop()
 --   log        optional {d, i, w, e} functions taking one string
@@ -467,6 +468,13 @@ function Node:_onLid(closed)
   end
 end
 
+-- The first (asynchronous) lid read is done: a lid found closed at start counts as a lid close.
+function Node:_onLidReady(closed)
+  if not self.running or closed ~= true or self.lidClosed then return end
+  self.lidClosed = true
+  if self.active then self:_onInactive("lid closed (start)", false) end
+end
+
 -- ---------------------------------------------------------------- messages
 
 function Node:_sendHello(name)
@@ -527,7 +535,9 @@ function Node:start()
   self.running = true
 
   local useLid = self.cfg.activity ~= nil and self.cfg.activity.lid == true and self.lid ~= nil
-  if useLid then self.lid:start(function(closed) self:_onLid(closed) end) end
+  if useLid then
+    self.lid:start(function(closed) self:_onLid(closed) end, function(closed) self:_onLidReady(closed) end)
+  end
 
   local active, reason = self.activity:initial()
   if useLid and self.lid:closed() == true then

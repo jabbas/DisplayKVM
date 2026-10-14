@@ -13,13 +13,13 @@ end)
 describe("LidSensor instance", function()
   local timer, screens, changes
 
-  local function build(script)
+  local function build(script, onReady)
     timer = fakes.timer()
     screens = fakes.screenWatcher()
     changes = {}
     local task = fakes.task(script)
     local lid = LidSensor.new({ screenWatcher = screens, task = task, timer = timer })
-    lid:start(function(closed) changes[#changes + 1] = closed end)
+    lid:start(function(closed) changes[#changes + 1] = closed end, onReady)
     return lid, task
   end
 
@@ -40,6 +40,64 @@ describe("LidSensor instance", function()
     assert.are.same({}, changes)
     assert.are.equal(1, #screens.watchers)
     assert.is_true(screens.watchers[1].started)
+  end)
+
+  describe("onReady", function()
+    local ready
+    local function onReady(...) ready[#ready + 1] = table.pack(...) end
+
+    before_each(function() ready = {} end)
+
+    it("is called once with true when the first read says the lid is closed", function()
+      local lid, task = build({ YES, NO }, onReady)
+      assert.are.equal(0, #ready)
+      task.finish()
+      assert.are.equal(1, #ready)
+      assert.is_true(ready[1][1])
+      assert.is_true(lid:closed())
+      assert.are.same({}, changes)
+    end)
+
+    it("is called with false when the lid is open", function()
+      local _, task = build({ NO }, onReady)
+      task.finish()
+      assert.are.equal(1, #ready)
+      assert.is_false(ready[1][1])
+    end)
+
+    it("is called with nil when there is no lid or ioreg fails", function()
+      local _, task = build({ { 0, "no such key" } }, onReady)
+      task.finish()
+      assert.are.equal(1, #ready)
+      assert.is_nil(ready[1][1])
+      ready = {}
+      _, task = build({ { 1, "", "boom" } }, onReady)
+      task.finish()
+      assert.are.equal(1, #ready)
+      assert.is_nil(ready[1][1])
+    end)
+
+    it("is not called again for later changes", function()
+      local _, task = build({ NO, YES }, onReady)
+      task.finish()
+      screens.fire()
+      timer.advance(1.5)
+      task.finish()
+      assert.are.same({ true }, changes)
+      assert.are.equal(1, #ready)
+    end)
+
+    it("is not called when the sensor is stopped before the read completes", function()
+      local lid = build({ YES }, onReady)
+      lid:stop()
+      assert.are.equal(0, #ready)
+    end)
+
+    it("is optional", function()
+      local lid, task = build({ YES })
+      task.finish()
+      assert.is_true(lid:closed())
+    end)
   end)
 
   it("debounces screen changes into a single read and reports the change once", function()

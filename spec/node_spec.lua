@@ -738,6 +738,76 @@ describe("Node manual control and lifecycle", function()
     assert.equal(16, sim:input())
   end)
 
+  describe("lid state at start", function()
+    local function startActive(o, closed)
+      local sim = make({ lid = o.lid, delayed = true })
+      sim:setLocked("laptop", false)
+      sim:setIdle("laptop", 0)
+      sim:setClosed("laptop", closed)
+      sim:start()
+      return sim
+    end
+
+    local function infoLines(sim, pattern)
+      local n = 0
+      for _, line in ipairs(sim.logLines) do
+        if line:find("^laptop i ") and line:find(pattern, 1, true) then n = n + 1 end
+      end
+      return n
+    end
+
+    it("L1 a lid found closed while the node started active releases like a lid close", function()
+      local sim = startActive({ lid = true }, true)
+      sim:advance(10)
+      assert.equal(1, infoLines(sim, "inactive (lid closed (start))"))
+      assert.equal(15, sim:input())
+      assert.is_false(sim:presence("desk-mini", "laptop").active)
+      assert.is_false(sim:presence("laptop", "laptop").active)
+      assert.is_true(sim:node("laptop").lidClosed)
+      sim:setLocked("laptop", false)
+      sim:activate("laptop") -- ignored while the lid is closed
+      sim:advance(5)
+      assert.equal(15, sim:input())
+    end)
+
+    it("L2 an open lid at start changes nothing", function()
+      local sim = startActive({ lid = true }, false)
+      sim:advance(10)
+      assert.equal(0, infoLines(sim, "lid closed"))
+      assert.equal(16, sim:input())
+      assert.is_true(sim:presence("desk-mini", "laptop").active)
+    end)
+
+    it("L3 a closed lid is ignored when the lid sensor is not enabled", function()
+      local sim = startActive({ lid = false }, true)
+      sim:advance(10)
+      assert.equal(0, infoLines(sim, "lid closed"))
+      assert.equal(16, sim:input())
+    end)
+
+    it("L4 a lid found closed on an inactive node does not release but blocks activity until it opens", function()
+      local sim = make({ lid = true, delayed = true })
+      sim:setClosed("laptop", true)
+      sim:start()
+      sim:advance(1)
+      assert.equal(0, infoLines(sim, "inactive (lid closed (start))"))
+      assert.is_true(sim:node("laptop").lidClosed)
+      sim:activate("laptop")
+      sim:advance(5)
+      assert.equal(15, sim:input())
+      sim:lid("laptop", false)
+      sim:advance(5)
+      assert.equal(16, sim:input())
+    end)
+
+    it("L5 a stop before the first read completes ignores the late result", function()
+      local sim = startActive({ lid = true }, true)
+      sim:node("laptop"):stop()
+      sim:advance(1)
+      assert.equal(0, infoLines(sim, "lid closed (start)"))
+    end)
+  end)
+
   it("an opened lid while the session is locked does not claim", function()
     local sim = make({ lid = true })
     sim:lid("laptop", true)

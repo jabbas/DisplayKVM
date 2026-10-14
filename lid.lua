@@ -65,22 +65,26 @@ function LidSensor:_refresh(onChange)
 end
 
 -- onChange(closed: boolean) fires only when the lid state changes after the initial read.
+-- onReady(closed: boolean|nil), optional, fires once when the initial read has completed (nil: no lid
+-- or ioreg failed); it is not called if the sensor is stopped first.
 -- Without a lid (no key, or ioreg failure) the sensor stays inactive and registers no watcher.
-function LidSensor:start(onChange)
+function LidSensor:start(onChange, onReady)
   self:stop()
   local generation = self._generation
   self:_read(function(closed)
     self._closed = closed
-    if closed == nil then return end
-    self._watcher = self._screenWatcher.new(function()
-      if self._pending then self._pending:stop() end
-      self._pending = self._timer.doAfter(self._debounce, function()
-        self._pending = nil
-        if generation ~= self._generation then return end
-        self:_refresh(onChange)
+    if closed ~= nil then
+      self._watcher = self._screenWatcher.new(function()
+        if self._pending then self._pending:stop() end
+        self._pending = self._timer.doAfter(self._debounce, function()
+          self._pending = nil
+          if generation ~= self._generation then return end
+          self:_refresh(onChange)
+        end)
       end)
-    end)
-    self._watcher:start()
+      self._watcher:start()
+    end
+    if onReady then onReady(closed) end
   end)
 end
 
