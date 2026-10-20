@@ -60,6 +60,50 @@ local function normaliseMatch(id, match, inputs)
   return out
 end
 
+-- `control`: nodes allowed to switch the monitor via DDC. Defaults to every node in `inputs`.
+-- Always returns a new, sorted, de-duplicated list.
+local function normaliseControl(id, control, inputs)
+  if control == nil then return sortedKeys(inputs) end
+  if type(control) ~= "table" or next(control) == nil then
+    return fail("displays.%s.control must be a non-empty list of node names", id)
+  end
+  local seen, out = {}, {}
+  for k, node in pairs(control) do
+    if math.type(k) ~= "integer" or k < 1 or k > #control then
+      return fail("displays.%s.control must be a list of node names (bad key %s)", id, tostring(k))
+    end
+    if type(node) ~= "string" or inputs[node] == nil then
+      return fail("displays.%s.control '%s' has no entry in inputs", id, tostring(node))
+    end
+    if not seen[node] then
+      seen[node] = true
+      out[#out + 1] = node
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+-- `whenAway` / `mirrorTo`: table of node -> value, every node must have an entry in `inputs`.
+-- `valid(value)` checks the value; `expected` describes it in the error message.
+local function normaliseNodeMap(id, field, map, inputs, valid, expected)
+  if map == nil then return {} end
+  if type(map) ~= "table" then
+    return fail("displays.%s.%s must be a table of node -> value", id, field)
+  end
+  local out = {}
+  for node, value in pairs(map) do
+    if type(node) ~= "string" or inputs[node] == nil then
+      return fail("displays.%s.%s '%s' has no entry in inputs", id, field, tostring(node))
+    end
+    if not valid(value) then
+      return fail("displays.%s.%s.%s must be %s", id, field, node, expected)
+    end
+    out[node] = value
+  end
+  return out
+end
+
 local function normaliseDisplay(id, d)
   if type(d) ~= "table" then return fail("displays.%s must be a table", id) end
 
@@ -92,7 +136,23 @@ local function normaliseDisplay(id, d)
     return fail("displays.%s.pull must be a boolean", id)
   end
 
-  return { match = match, inputs = inputs, home = home, pull = pull }
+  local control, cerr = normaliseControl(id, d.control, inputs)
+  if not control then return nil, cerr end
+
+  local whenAway, werr = normaliseNodeMap(id, "whenAway", d.whenAway, inputs, function(v)
+    return v == "mirror"
+  end, "\"mirror\"")
+  if not whenAway then return nil, werr end
+
+  local mirrorTo, merr = normaliseNodeMap(id, "mirrorTo", d.mirrorTo, inputs, function(v)
+    return type(v) == "string" and v ~= ""
+  end, "a non-empty display UUID string")
+  if not mirrorTo then return nil, merr end
+
+  return {
+    match = match, inputs = inputs, home = home, pull = pull,
+    control = control, whenAway = whenAway, mirrorTo = mirrorTo,
+  }
 end
 
 local function normaliseActivity(raw)

@@ -57,7 +57,10 @@ describe("Config", function()
       assert.are.equal(30, cfg.heartbeat)
       assert.are.equal("info", cfg.logLevel)
       assert.are.same({
-        left = { match = "DELL", inputs = { ["desk-mini"] = 15, laptop = 16 }, home = "desk-mini", pull = true },
+        left = {
+          match = "DELL", inputs = { ["desk-mini"] = 15, laptop = 16 }, home = "desk-mini", pull = true,
+          control = { "desk-mini", "laptop" }, whenAway = {}, mirrorTo = {},
+        },
       }, cfg.displays)
     end)
 
@@ -187,6 +190,100 @@ describe("Config", function()
     end)
     it("reject a non-boolean pull", function()
       fails(with(function(r) r.displays.left.pull = "yes" end), "pull")
+    end)
+
+    describe("control, whenAway, mirrorTo", function()
+      it("defaults control to every node with an input, sorted", function()
+        local cfg, err = Config.validate(with(function(r)
+          r.displays.left.inputs = { laptop = 21, ["desk-mini"] = 17 }
+        end), env)
+        assert.is_nil(err)
+        assert.are.same({ "desk-mini", "laptop" }, cfg.displays.left.control)
+        assert.are.same({}, cfg.displays.left.whenAway)
+        assert.are.same({}, cfg.displays.left.mirrorTo)
+      end)
+
+      it("accepts control as a subset of inputs", function()
+        local cfg, err = Config.validate(with(function(r)
+          r.displays.left.control = { "laptop" }
+        end), env)
+        assert.is_nil(err)
+        assert.are.same({ "laptop" }, cfg.displays.left.control)
+      end)
+
+      it("returns control as a sorted copy, not the user's table", function()
+        local ctl = { "laptop", "desk-mini" }
+        local r = deep(raw)
+        r.displays.left.control = ctl
+        local cfg = Config.validate(r, env)
+        assert.are.same({ "desk-mini", "laptop" }, cfg.displays.left.control)
+        assert.are_not.equal(ctl, cfg.displays.left.control)
+        assert.are.same({ "laptop", "desk-mini" }, ctl)
+      end)
+
+      it("copies whenAway and mirrorTo", function()
+        local wa, mt = { ["desk-mini"] = "mirror" }, { ["desk-mini"] = "UUID-1" }
+        local r = deep(raw)
+        r.displays.left.whenAway = wa
+        r.displays.left.mirrorTo = mt
+        local cfg, err = Config.validate(r, env)
+        assert.is_nil(err)
+        assert.are.same(wa, cfg.displays.left.whenAway)
+        assert.are.same(mt, cfg.displays.left.mirrorTo)
+        assert.are_not.equal(wa, cfg.displays.left.whenAway)
+        assert.are_not.equal(mt, cfg.displays.left.mirrorTo)
+      end)
+
+      it("allows whenAway for a node that is also in control", function()
+        local cfg, err = Config.validate(with(function(r)
+          r.displays.left.whenAway = { laptop = "mirror" }
+        end), env)
+        assert.is_nil(err)
+        assert.are.same({ laptop = "mirror" }, cfg.displays.left.whenAway)
+        assert.are.same({ "desk-mini", "laptop" }, cfg.displays.left.control)
+      end)
+
+      it("rejects an empty control", function()
+        fails(with(function(r) r.displays.left.control = {} end), "displays.left.control")
+      end)
+      it("rejects a control node without an input", function()
+        local r = with(function(x) x.displays.left.control = { "studio" } end)
+        fails(r, "control")
+        fails(r, "studio")
+      end)
+      it("rejects a control that is not a table", function()
+        fails(with(function(r) r.displays.left.control = "laptop" end), "control")
+      end)
+      it("rejects a non-string control entry", function()
+        fails(with(function(r) r.displays.left.control = { 5 } end), "control")
+      end)
+      it("rejects a whenAway value other than mirror", function()
+        fails(with(function(r) r.displays.left.whenAway = { ["desk-mini"] = "hide" } end), "whenAway")
+      end)
+      it("rejects whenAway for a node without an input", function()
+        fails(with(function(r) r.displays.left.whenAway = { studio = "mirror" } end), "whenAway")
+      end)
+      it("rejects a whenAway that is not a table", function()
+        fails(with(function(r) r.displays.left.whenAway = "mirror" end), "whenAway")
+      end)
+      it("rejects a whenAway key that is not a string", function()
+        fails(with(function(r) r.displays.left.whenAway = { "mirror" } end), "whenAway")
+      end)
+      it("rejects a non-string mirrorTo value", function()
+        fails(with(function(r) r.displays.left.mirrorTo = { ["desk-mini"] = 42 } end), "mirrorTo")
+      end)
+      it("rejects an empty mirrorTo value", function()
+        fails(with(function(r) r.displays.left.mirrorTo = { ["desk-mini"] = "" } end), "mirrorTo")
+      end)
+      it("rejects mirrorTo for a node without an input", function()
+        fails(with(function(r) r.displays.left.mirrorTo = { studio = "UUID" } end), "mirrorTo")
+      end)
+      it("rejects a mirrorTo that is not a table", function()
+        fails(with(function(r) r.displays.left.mirrorTo = "UUID" end), "mirrorTo")
+      end)
+      it("rejects a mirrorTo key that is not a string", function()
+        fails(with(function(r) r.displays.left.mirrorTo = { "UUID" } end), "mirrorTo")
+      end)
     end)
   end)
 
