@@ -1313,11 +1313,80 @@ describe("whenAway mirror", function()
     assert.is_false(sim:node("desk-mini"):status().displays.left.mirrored)
   end)
 
-  it("M13 a stale mirror at start with an unknown owner is stopped at once", function()
+  it("M13 a stale mirror at start with an unknown owner waits for the first peer state, then is stopped", function()
     local sim = staleMirror()
     sim:start("desk-mini")
+    assert.is_true(sim:mirrored("desk-mini")) -- grace period: nothing is known yet
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    sim:advance(1) -- the laptop's state arrives and names no owner
     assert.is_false(sim:mirrored("desk-mini"))
     assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+  end)
+
+  it("M13b reload while the laptop owns the display: the mirror is neither dropped nor repeated", function()
+    local sim = staleMirror()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:start("desk-mini") -- reload without stop(): the state is empty, the mirror is still there
+    sim:advance(10)
+    assert.equal("laptop", sim:owner("desk-mini"))
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_true(sim:node("desk-mini"):status().displays.left.mirrored)
+  end)
+
+  it("M13c no peer answers within 5 s: the stale mirror is stopped then, not before", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = { ["desk-mini"] = "mirror" },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim.mirroring["desk-mini"] = true
+    sim:start("desk-mini") -- the laptop is not running
+    sim:advance(4.5)
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    sim:advance(1)
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
+  it("M13d the grace timer is gone after stop()", function()
+    local sim = staleMirror()
+    sim:start("desk-mini")
+    sim:node("desk-mini"):stop()
+    local before = sim:mirrorCalls("desk-mini").unmirror
+    sim:advance(10)
+    assert.equal(before, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
+  it("M18 a suspected mirror whose display turns out to be visible is dropped and mirrored for real", function()
+    local sim = staleMirror("laptop") -- the display is absent at start; the laptop owns it
+    sim:start("desk-mini")
+    sim:advance(1)
+    assert.is_true(sim:node("desk-mini"):status().displays.left.mirrored) -- suspected
+    sim.mirroring["desk-mini"] = false -- the monitor is plugged in: it was never mirrored
+    sim:advance(31) -- the next heartbeat state from the laptop
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(1, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_true(sim:mirrored("desk-mini"))
+  end)
+
+  it("M18b a dropped suspected mirror is not reported as mirrored when mirroring then fails", function()
+    local sim = staleMirror("laptop")
+    sim:start("desk-mini")
+    sim:advance(1)
+    sim.mirroring["desk-mini"] = false
+    sim.mirrorFails["desk-mini"] = true
+    sim:advance(31)
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.is_false(sim:node("desk-mini"):status().displays.left.mirrored)
   end)
 
   it("M14 a stale mirror at start while another node owns the display stays, without a second mirror", function()

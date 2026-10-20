@@ -44,6 +44,7 @@ local SLEEP_SWITCH_TIMEOUT = 2
 local NOTIFY_INTERVAL_MS = 300000
 local ALIVE_INTERVALS = 3
 local UNALIASED_HELLO_INTERVAL_MS = 5000
+local AWAY_GRACE = 5
 
 local WIRE_REASONS = {
   ["not-visible"] = "not-visible",
@@ -79,6 +80,7 @@ function Node.new(cfg, deps)
   self.mirrored = {}      -- display id -> uuid of the screen it is mirrored onto (whenAway)
   self.mirrorWarned = {}  -- display id -> owner for which a failed mirror was already warned about
   self.stopWarned = {}    -- display id -> true after a failed unmirror was warned about (reset on success)
+  self.suspected = {}     -- display id -> true while `mirrored` is only a guess made at start
   self.active = false
   self.lidClosed = false
   self.running = false
@@ -138,15 +140,35 @@ function Node:_syncAway()
   if self.away == nil or not self.running then return end
   for id, d in pairs(self.cfg.displays) do
     if d.whenAway ~= nil and d.whenAway[self.me] == "mirror" and self.displays[id] ~= nil then
+      -- A suspected mirror (see _recoverAway) is disproved by the display showing up among the screens.
+      if self.suspected[id] and self.displays[id]:target() ~= nil then
+        self.log.i(id .. " is among the screens, so it was not mirrored after all")
+        self.suspected[id], self.mirrored[id] = nil, nil
+      end
       local owner = self.state:owner(id)
       local want = owner ~= nil and owner ~= self.me
       if want and self.mirrored[id] == nil then
         self:_startMirror(id, owner, d.mirrorTo and d.mirrorTo[self.me])
       elseif not want and self.mirrored[id] ~= nil then
-        self:_stopMirror(id)
+        -- Right after a reload the state is empty: wait to hear who owns the display instead of
+        -- un-mirroring now only to mirror again when the first peer answers.
+        if self.suspected[id] and owner == nil and self.awayGrace then
+          self.log.d("keeping the suspected mirror of " .. id .. " until a peer has been heard")
+        else
+          self:_stopMirror(id)
+        end
       end
     end
   end
+end
+
+-- Ends the start-up grace period (first verified state from a peer, or its timer) and applies the rule.
+function Node:_awayHeard()
+  if self.awayGrace then
+    self.awayGrace = false
+    if self.awayGraceTimer then self.awayGraceTimer:stop() self.awayGraceTimer = nil end
+  end
+  self:_syncAway()
 end
 
 function Node:_startMirror(id, owner, targetUuid)
@@ -177,25 +199,37 @@ function Node:_stopMirror(id)
   end
   self.stopWarned[id] = nil
   self.mirrored[id] = nil
+  self.suspected[id] = nil
   self.log.i(id .. " is back, mirror stopped")
 end
 
 -- A mirror outlives the process that made it (Hammerspoon reload without stop(), a crash): macOS stays
 -- mirrored and the display is missing from the screens. At start a whenAway display that is not among the
 -- screens is therefore treated as possibly mirrored by a previous run: record it, so that the first moment
--- this node wants its own screens (owner is this node, or not known yet) it is un-mirrored. While another
--- node owns the display the mirror simply stays; it is not mirrored a second time.
+-- this node wants its own screens it is un-mirrored. While another node owns the display the mirror simply
+-- stays; it is not mirrored a second time. The state is empty after a reload, so an unknown owner is given
+-- a grace period (AWAY_GRACE seconds, or until the first peer state arrives) before it counts as "mine".
 function Node:_recoverAway()
   if self.away == nil then return end
+  local suspectedAny = false
   for id, d in pairs(self.cfg.displays) do
     if d.whenAway ~= nil and d.whenAway[self.me] == "mirror" and self.displays[id] ~= nil
         and self.mirrored[id] == nil and self.displays[id]:target() == nil then
       local uuid = (d.mirrorTo and d.mirrorTo[self.me]) or self.away:defaultTarget(nil)
       if uuid ~= nil then
         self.mirrored[id] = uuid
+        self.suspected[id] = true
+        suspectedAny = true
         self.log.i(id .. " is not among the screens at start, assuming a mirror left by a previous run")
       end
     end
+  end
+  if suspectedAny then
+    self.awayGrace = true
+    self.awayGraceTimer = self.timer.doAfter(AWAY_GRACE, function()
+      self.awayGraceTimer = nil
+      if self.running then self:_awayHeard() end
+    end)
   end
 end
 
@@ -650,7 +684,7 @@ function Node:_sendHello(name)
     if not ok then return self.log.d("hello to " .. tostring(name) .. " failed: " .. tostring(status)) end
     if type(reply) == "table" then
       self.state:merge(reply.state)
-      self:_syncAway()
+      self:_awayHeard()
     end
     if self.lastSeenFrom then self:_ownerReturned(self.lastSeenFrom) end
   end)
@@ -689,12 +723,12 @@ function Node:onMessage(msg)
   local body = type(msg.body) == "table" and msg.body or {}
   if msg.type == "hello" then
     self.state:merge(body.state)
-    self:_syncAway()
+    self:_awayHeard()
     self:_ownerReturned(from)
     return 200, self:_stateBody()
   elseif msg.type == "state" then
     self.state:merge(body.state)
-    self:_syncAway()
+    self:_awayHeard()
     return 204, nil
   elseif msg.type == "request" then
     return 200, self:_handleRequest(body)
@@ -745,6 +779,8 @@ function Node:stop()
   if self.heartbeat then self.heartbeat:stop() self.heartbeat = nil end
   self:_cancelIntents()
   -- Leave nothing mirrored behind: the display must be back for whoever runs next (or for the user).
+  if self.awayGraceTimer then self.awayGraceTimer:stop() self.awayGraceTimer = nil end
+  self.awayGrace = false
   if self.away ~= nil then
     local ids = {}
     for id in pairs(self.mirrored) do ids[#ids + 1] = id end
