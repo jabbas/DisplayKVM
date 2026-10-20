@@ -39,6 +39,8 @@
 -- Network: sim:partition(name, bool); sim:hello(name) makes `name` greet every started peer, like a
 --   fresh Bonjour announcement; sim:restart(name, {keepOld = true}) starts a new instance of the node
 --   (the old one keeps running when keepOld is set, so it can be heard again).
+-- Screens: every node gets a fake screen watcher; sim:unplug(name[, {silent=true}]) / sim:plug(name) hide or
+--   show the monitor for `name` (see Sim:unplug).
 -- Observation: sim:input(), sim:owner(viewer), sim:presence(viewer, name), sim:node(name), sim:state(name),
 --   sim.monitor (commands, applied, stuck, failing), sim.counts[name] = {switchTo, switchToSync, sendSync,
 --   broadcastSync, cancel}, sim.messages (every send), sim:sent{from=,to=,type=}, sim.notifications,
@@ -106,7 +108,9 @@ local function newDisplay(sim, node, id, spec)
 
   function d:inputFor(n) return spec.inputs[n] end
   -- Fact F8: a mirrored screen disappears from the screens of the node that mirrors it.
-  function d:visible() return sim.monitor:visibleTo(node) and not sim.mirroring[node] end
+  function d:visible()
+    return not sim.unplugged[node] and sim.monitor:visibleTo(node) and not sim.mirroring[node]
+  end
   function d:target()
     if not self:visible() then return nil end
     return { uuid = "UUID-" .. id, name = id }
@@ -322,6 +326,7 @@ function Sim:_build(name)
     return true
   end
 
+  entry.screenWatcher = fakes.screenWatcher()
   entry.resolve = newResolver(self, entry)
   entry.transport = newTransport(self, entry)
   entry.discovery = newDiscovery(self, entry)
@@ -368,6 +373,7 @@ function Sim:_build(name)
     activity = activity,
     lid = lid,
     away = away,
+    screenWatcher = entry.screenWatcher,
     now = self.now,
     timer = self.timer,
     log = log,
@@ -409,6 +415,7 @@ function Sim.new(opts)
   self.lidEnabled = opts.lid == true
   self.whenAway, self.mirrorTo = opts.whenAway, opts.mirrorTo
   self.mirroring, self.mirrorCount, self.mirrorFails, self.unmirrorFails = {}, {}, {}, {}
+  self.unplugged = {}
   for _, node in ipairs(opts.nodes) do self.mirrorCount[node] = { mirror = 0, unmirror = 0 } end
   self.monitor = newMonitor({
     inputs = opts.monitor.inputs,
@@ -459,6 +466,7 @@ end
 
 function Sim:advance(sec) self.timer.advance(sec) end
 function Sim:node(name) return self.entries[name].node end
+function Sim:entry(name) return self.entries[name] end
 function Sim:state(name) return self.entries[name].state end
 function Sim:input() return self.monitor.input end
 function Sim:owner(viewer) return (self.entries[viewer].state:owner(self.displayId)) end
@@ -487,6 +495,22 @@ end
 function Sim:lid(name, closed)
   self.sensors[name].closed = closed
   self.entries[name].onLid(closed)
+end
+
+-- The cable between `name` and the monitor is pulled (F7): the monitor is no longer visible to `name`, and
+-- if it was showing `name`'s input it falls back to the home input (Auto-Switch Input). The node's screen
+-- watcher fires afterwards unless opts.silent (to exercise the heartbeat backup). sim:plug reverses it.
+function Sim:unplug(name, opts)
+  self.unplugged[name] = true
+  if self.monitor.input == self.monitor.inputs[name] then
+    self.monitor.input = self.monitor.inputs[self.home]
+  end
+  if not (opts and opts.silent) then self.entries[name].screenWatcher.fire() end
+end
+
+function Sim:plug(name, opts)
+  self.unplugged[name] = false
+  if not (opts and opts.silent) then self.entries[name].screenWatcher.fire() end
 end
 
 function Sim:hello(name)

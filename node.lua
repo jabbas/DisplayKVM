@@ -26,6 +26,9 @@
 --   away       optional Away (away.lua): :mirror(sourceUuid, targetUuid|nil) -> ok, usedTargetUuid
 --              :unmirror(targetUuid) -> ok, :defaultTarget(excludeUuid|nil) -> uuid|nil;
 --              used only for displays with cfg.displays[id].whenAway[me] == "mirror"
+--   screenWatcher optional hs.screen.watcher-like: .new(fn) -> object with :start() :stop(); a screen change
+--              schedules a debounced (2 s) check whether a display this node owns has disappeared (R3a).
+--              Without it only the heartbeat runs that check
 --   lid        optional LidSensor: :start(onChange(closed), onReady(closed|nil)) :stop() :closed(); used only if
 --              cfg.activity.lid. onReady fires once, after the asynchronous first read of the lid state
 --   now        function() -> integer milliseconds (also the clock for State timestamps)
@@ -69,6 +72,7 @@ function Node.new(cfg, deps)
   self.activity = deps.activity
   self.lid = deps.lid
   self.away = deps.away
+  self.screenWatcherFactory = deps.screenWatcher
   self.now = deps.now
   self.timer = deps.timer
   self.log = deps.log or { d = noop, i = noop, w = noop, e = noop }
@@ -260,7 +264,70 @@ function Node:_helloUnaliased()
   end
 end
 
+-- ---------------------------------------------------------------- state recovery without DDC
+
+local SCREEN_DEBOUNCE = 2
+
+-- R3a. A controller that owns a display and no longer sees it has lost it: with the monitor's input
+-- auto-switch (F7) it fell back to the home node, which has no DDC to be told. Record that in the state.
+-- Not for a display this node mirrors itself (it is hidden by our own doing), nor while a release of the
+-- display is in flight (it will write the owner by itself, and the target may not be home).
+function Node:_checkHeld()
+  if not self.running then return end
+  local ids = {}
+  for id in pairs(self.displays) do ids[#ids + 1] = id end
+  table.sort(ids)
+  for _, id in ipairs(ids) do
+    local home = self.cfg.displays[id].home
+    if self.state:owner(id) == self.me and home ~= nil and home ~= self.me and self:_canSwitch(id, self.me)
+        and self.mirrored[id] == nil and not self.releasing[id] and not self.displays[id]:visible() then
+      self.log.i(id .. " disappeared, assuming it switched to " .. home)
+      self:_writeOwner(id, home)
+      self:_broadcast()
+    end
+  end
+end
+
+-- R3b. The home node cannot run DDC. When the display's owner is gone and so is every node that could
+-- switch it, the monitor has fallen back to the home input on its own: take the ownership in the state.
+-- Needs no activity of this node and sends no DDC.
+function Node:_recoverHome()
+  if not self.running then return end
+  local ids = {}
+  for id in pairs(self.displays) do ids[#ids + 1] = id end
+  table.sort(ids)
+  for _, id in ipairs(ids) do
+    local owner = self.state:owner(id)
+    if self.cfg.displays[id].home == self.me and not self:_canSwitch(id, self.me)
+        and owner ~= nil and owner ~= self.me and not self:alive(owner) and not self:_anyControllerAlive(id) then
+      self.log.i(string.format("%s: owner %s and every node with control are gone, taking ownership in the state",
+        id, owner))
+      self:_writeOwner(id, self.me)
+      self:_broadcast()
+    end
+  end
+end
+
+function Node:_anyControllerAlive(id)
+  for name in pairs(self.lastSeen) do
+    if name ~= self.me and self:alive(name) and self:_canSwitch(id, name) then return true end
+  end
+  return false
+end
+
+-- A screen change is followed by one check after a quiet period of SCREEN_DEBOUNCE seconds.
+function Node:_onScreensChanged()
+  if not self.running then return end
+  if self.screenTimer then self.screenTimer:stop() end
+  self.screenTimer = self.timer.doAfter(SCREEN_DEBOUNCE, function()
+    self.screenTimer = nil
+    self:_checkHeld()
+  end)
+end
+
 function Node:_heartbeat()
+  self:_checkHeld()
+  self:_recoverHome()
   local body = self:_stateBody()
   local hello = {}
   for _, address in ipairs(self.discovery:unaliased(function(name) return self:alive(name) end)) do
@@ -767,6 +834,10 @@ function Node:start()
   end)
   self.activity:start(function(isActive, why, sync) self:_onActivity(isActive, why, sync) end)
   self.heartbeat = self.timer.doEvery(self.cfg.heartbeat, function() self:_heartbeat() end)
+  if self.screenWatcherFactory ~= nil then
+    self.screens = self.screenWatcherFactory.new(function() self:_onScreensChanged() end)
+    self.screens:start()
+  end
 
   if active then self:_onActive("start") end
   self:_syncAway()
@@ -777,6 +848,8 @@ function Node:stop()
   if not self.running then return end
   self.running = false
   if self.heartbeat then self.heartbeat:stop() self.heartbeat = nil end
+  if self.screens then self.screens:stop() self.screens = nil end
+  if self.screenTimer then self.screenTimer:stop() self.screenTimer = nil end
   self:_cancelIntents()
   -- Leave nothing mirrored behind: the display must be back for whoever runs next (or for the user).
   if self.awayGraceTimer then self.awayGraceTimer:stop() self.awayGraceTimer = nil end
