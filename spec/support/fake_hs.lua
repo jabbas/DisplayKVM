@@ -6,7 +6,8 @@
 -- install(opts):
 --   opts.hostname       value of hs.host.localizedName() (default "desk-mini")
 --   opts.existingFiles  set {path = true} of paths hs.fs.attributes reports as existing
---   opts.full           also install timer, json, hash, screen, host, task, caffeinate, http, httpserver, bonjour
+--   opts.full           also install timer, json, hash, screen (+ find, primaryScreen, watcher), window, host, task,
+--                       caffeinate, http, httpserver, bonjour
 --
 -- calls: ordered list of {name, args} records; name is one of "logger.new", "log.d|i|w|e", "log.setLogLevel",
 --   "notify.new", "notify.send", "bindHotkeysToSpec". Loading init.lua must not add any entry except logger ones.
@@ -64,7 +65,15 @@ local function addFull(hs)
     watcher = fakes.screenWatcher(),
     screens = {},
     allScreens = function() return hs.screen.screens end,
+    primaryScreen = function() return hs.screen.screens[1] end,
+    find = function(uuid)
+      for _, s in ipairs(hs.screen.screens) do
+        if s:getUUID() == uuid then return s end
+      end
+      return nil
+    end,
   }
+  hs.window = { allWindows = function() return {} end }
 end
 
 function M.install(opts)

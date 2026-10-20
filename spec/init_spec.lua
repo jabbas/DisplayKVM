@@ -44,7 +44,7 @@ describe("init", function()
       fake_hs.install()
       local obj = dofile("init.lua")
       assert.are.equal("DisplayKVM", obj.name)
-      assert.are.equal("0.1.1", obj.version)
+      assert.are.equal("0.2.0", obj.version)
       assert.are.equal("Grzegorz Dzięgielewski <jabbas@jabbas.eu>", obj.author)
       assert.are.equal("MIT - https://opensource.org/licenses/MIT", obj.license)
       assert.are.equal("https://github.com/jabbas/DisplayKVM", obj.homepage)
@@ -358,6 +358,87 @@ describe("init", function()
       assert.are.equal(obj, obj:claim())
       assert.are.equal(obj, obj:release())
       assert.are.equal(obj, obj:claim("nope"))
+    end)
+
+    describe("whenAway mirror wiring", function()
+      local function fakeScreen(uuid, name)
+        local s = { uuid = uuid, nm = name, mirrored = {}, stops = 0 }
+        function s:getUUID() return self.uuid end
+        function s:name() return self.nm end
+        function s:mirrorOf(other) self.mirrored[#self.mirrored + 1] = other return true end
+        function s:mirrorStop() self.stops = self.stops + 1 return true end
+        return s
+      end
+
+      local function peerState(owner)
+        local Message = dofile("message.lua")
+        local n = 0
+        local peer = Message.new({
+          secret = SECRET,
+          node = "laptop",
+          instance = "00000000deadbeef",
+          hmac = function(k, d) return hs.hash.new("hmacSHA256", k):append(d):finish():value() end,
+          now = function() return math.floor(hs.timer.secondsSinceEpoch() * 1000) end,
+          random = function() n = n + 1 return string.format("%032x", n) end,
+          codec = { encode = hs.json.encode, decode = hs.json.decode },
+        })
+        local raw, sig = peer:build("state", {
+          state = { owner = { main = { node = owner, ts = 4000000000000 } }, presence = {} },
+        })
+        return hs.httpserver.created[1].request("POST", "/v1/msg", { ["X-DisplayKVM-Sig"] = sig }, raw)
+      end
+
+      it("starts the screen watcher also without whenAway (state recovery needs it)", function()
+        obj:start()
+        assert.is_true(#hs.screen.watcher.watchers >= 1)
+        assert.is_true(hs.screen.watcher.watchers[1].started)
+      end)
+
+      it("builds the Away adapter from hs.screen / hs.window when whenAway is configured", function()
+        local external, primary = fakeScreen("EXT-UUID", "DELL U2720Q"), fakeScreen("PRIMARY-UUID", "Built-in")
+        hs.screen.screens = { primary, external }
+        local found = {}
+        local realFind = hs.screen.find
+        hs.screen.find = function(uuid) found[#found + 1] = uuid return realFind(uuid) end
+        local moved = 0
+        hs.window.allWindows = function()
+          return { { setFrameInScreenBounds = function() moved = moved + 1 end } }
+        end
+        obj:configure(validConfig({
+          displays = {
+            main = {
+              match = "DELL", inputs = { ["desk-mini"] = 15, laptop = 16 },
+              whenAway = { ["desk-mini"] = "mirror" },
+            },
+          },
+        }))
+        obj:start()
+        assert.are.same({}, found) -- this node owns the display (or nothing is known): no mirror yet
+
+        local _, status = peerState("laptop")
+        assert.are.equal(204, status)
+        assert.are.same({ "EXT-UUID" }, found)
+        assert.are.equal(1, #external.mirrored)
+        assert.are.equal(primary, external.mirrored[1])
+
+        hs.timer.advance(2.1) -- settle: windows are pulled back into the screen bounds
+        assert.are.equal(1, moved)
+
+        obj:stop() -- stop() leaves nothing mirrored
+        assert.are.equal(1, primary.stops)
+      end)
+
+      it("does not touch hs.screen.find without whenAway", function()
+        local external = fakeScreen("EXT-UUID", "DELL U2720Q")
+        hs.screen.screens = { fakeScreen("PRIMARY-UUID", "Built-in"), external }
+        local found = 0
+        local realFind = hs.screen.find
+        hs.screen.find = function(uuid) found = found + 1 return realFind(uuid) end
+        obj:start()
+        peerState("laptop")
+        assert.are.equal(0, found)
+        assert.are.equal(0, #external.mirrored)
+      end)
     end)
 
     it("claim() and release() are no-ops when stopped", function()

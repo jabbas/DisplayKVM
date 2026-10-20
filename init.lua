@@ -29,7 +29,7 @@ obj.__index = obj
 
 -- Metadata
 obj.name = "DisplayKVM"
-obj.version = "0.1.1"
+obj.version = "0.2.0"
 obj.author = "Grzegorz Dzięgielewski <jabbas@jabbas.eu>"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 obj.homepage = "https://github.com/jabbas/DisplayKVM"
@@ -94,11 +94,21 @@ end
 --- Parameters:
 ---  * config - A table with these keys:
 ---    * secret - Required. At least 64 hex characters shared by all nodes (see `DisplayKVM.generateSecret()`)
----    * displays - Required. A table mapping a display id to `{ match = ..., inputs = ..., home = ..., pull = ... }`:
+---    * displays - Required. A table mapping a display id to
+---      `{ match = ..., inputs = ..., home = ..., pull = ..., control = ..., whenAway = ..., mirrorTo = ... }`:
 ---      * match - Required. A string (screen name substring, or a screen UUID) or a table node name -> string
 ---      * inputs - Required. A table node name -> DDC input value
 ---      * home - Optional. The node that gets the display on release. Defaults to the first node by name
 ---      * pull - Optional. Boolean, default `true`. Whether to pull the display from an active peer on claim
+---      * control - Optional. A non-empty list of the nodes that can switch this display over DDC; each
+---        must have an entry in `inputs`. Defaults to every node in `inputs`. A node outside the list never
+---        runs the DDC backend for this display: it asks a live node from the list to switch it (use it
+---        when a Mac's port has no working DDC, e.g. the HDMI port of a Mac mini M1)
+---      * whenAway - Optional. A table node name -> `"mirror"`: that node hides the display by mirroring it
+---        onto another screen while another node owns it (useful for a monitor that stays listed on every
+---        Mac whatever input is selected), and un-mirrors it when it owns the display again
+---      * mirrorTo - Optional. A table node name -> screen UUID to mirror onto. Default: the primary screen
+---        (or, when the display is the primary screen, the first other screen)
 ---    * node - Optional. This node's name. Defaults to `hs.host.localizedName()`; must appear in some `inputs`
 ---    * backend - Optional. `"m1ddc"` (default), `"ddcctl"`, `"betterdisplay"`, `"lunar"` or a
 ---      `function(display, input, done)` that calls `done(true)` or `done(false)`. A function backend
@@ -168,6 +178,7 @@ local function buildNode(self, cfg)
   local Runner = loadModule("runner.lua")
   local Node = loadModule("node.lua")
   local Policy = loadModule("policy.lua")
+  local Away = loadModule("away.lua")
 
   local instance = randomHex(8)
   local secret = secrets[self]
@@ -240,8 +251,26 @@ local function buildNode(self, cfg)
     lid = LidSensor.new({ screenWatcher = hs.screen.watcher, task = hs.task, timer = hs.timer })
   end
 
+  -- The mirror adapter only exists when some display is meant to be hidden while another node owns it.
+  local away
+  for _, spec in pairs(cfg.displays) do
+    if spec.whenAway ~= nil and next(spec.whenAway) ~= nil then
+      away = Away.new({
+        find = function(uuid) return hs.screen.find(uuid) end,
+        primary = function() return hs.screen.primaryScreen() end,
+        all = function() return hs.screen.allScreens() end,
+        windows = function() return hs.window.allWindows() end,
+        timer = hs.timer,
+        log = log,
+      })
+      break
+    end
+  end
+
   return Node.new(cfg, {
     state = State.new(),
+    away = away,
+    screenWatcher = hs.screen.watcher,
     policy = Policy,
     instances = Instances.new(2 * cfg.heartbeat * 1000),
     instance = instance,

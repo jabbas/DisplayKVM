@@ -108,6 +108,9 @@ the monitor's documentation). Common values are 15/16 (DisplayPort 1/2) and 17/1
 | `displays.<id>.inputs` | yes | — | `{ node = DDC input }`. A node without an entry does not take part in that display. |
 | `displays.<id>.home` | no | first node in `inputs` | Release target when no other node is active. |
 | `displays.<id>.pull` | no | `true` | Set `false` for monitors that ignore DDC while showing another input. Claims then always ask the current owner to push. |
+| `displays.<id>.control` | no | every node in `inputs` | Non-empty list of the nodes that can switch this display over DDC (each needs an entry in `inputs`). A node outside it never runs the backend for the display; it asks a live node from the list instead. See [Monitors that a Mac cannot control](#monitors-that-a-mac-cannot-control). |
+| `displays.<id>.whenAway` | no | — | `{ node = "mirror" }`: that node hides the display by mirroring it onto another screen while another node owns it, and stops mirroring when it owns the display again. `"mirror"` is the only value. |
+| `displays.<id>.mirrorTo` | no | primary screen | `{ node = UUID }`: the screen that node mirrors onto (default: its primary screen, or the first other screen when the display itself is primary). |
 | `port` | no | `8765` | Server port. |
 | `peers` | no | — | Static list of `"host:port"`, in addition to Bonjour. |
 | `bonjour` | no | `true` | `false` disables discovery (static peers only). |
@@ -165,6 +168,66 @@ backend = function(display, input, done)
 end,
 ```
 
+## Monitors that a Mac cannot control
+
+Two situations break the plain "every Mac sends DDC to the monitor" model. `control` and `whenAway` cover them;
+both are optional, and without them DisplayKVM behaves as before.
+
+**A Mac whose port has no working DDC.** Some ports pass no DDC/CI at all, and the backend still reports success. A
+known case is the HDMI port of a Mac mini M1: `m1ddc ... set input` exits with status 0, but the monitor does not
+react, and `get` always returns the same value. DisplayKVM cannot detect this failure on that Mac, and you cannot
+check it with `get` either: verify a port by watching the monitor react to `set input`. List the Macs that *can*
+switch the display in `control`. A node outside `control` never calls the backend for that display. Whenever it needs
+the display switched (to itself, or handed to another node) it sends a `request` to a live node in `control` (the
+current owner first, if it is in `control`; otherwise the live nodes in name order). A node in `control` handles that
+request as it always did. A node outside `control` that receives a `request` answers `failed` with the reason
+`not-capable` and does nothing.
+
+**A monitor that stays listed on every Mac ("sticky").** Some monitors remain in `hs.screen.allScreens()` on every Mac
+whatever input is selected. Then no Mac can tell whether it currently has the picture, and the Mac that does not have
+it still shows the monitor as a screen: the cursor and windows can wander onto an output nobody sees. Set `whenAway`
+for the nodes that should lose the screen: while another node owns the display, this node mirrors it onto another
+screen (`hs.screen:mirrorOf`), which removes it from the layout, and pulls windows left half off the edge back inside
+the screen. When the node owns the display again, it stops the mirror (`mirrorStop` on the target) and the windows
+return by themselves. The mirror is also applied at start and on reload, based on the state learned from the peers,
+and it is always removed by `stop()`. Mirroring is decided from the replicated state only, never by detecting the
+physical input.
+
+Example: the `desk-mini` Mac's HDMI port has no DDC, the laptop reaches the monitor over USB-C (with DDC), and the
+monitor is sticky. The input numbers are monitor specific; these are just illustrative:
+
+```lua
+left = {
+  match    = { ["desk-mini"] = "<UUID as seen from desk-mini>", laptop = "<UUID as seen from laptop>" },
+  inputs   = { ["desk-mini"] = 17, laptop = 21 },   -- HDMI, USB-C
+  home     = "desk-mini",
+  control  = { "laptop" },                          -- desk-mini (HDMI) has no DDC
+  whenAway = { ["desk-mini"] = "mirror" },          -- hide the monitor on desk-mini while the laptop has it
+  -- mirrorTo = { ["desk-mini"] = "<UUID of the screen to mirror onto>" },  -- default: the primary screen
+},
+```
+
+Because the home Mac cannot switch the monitor, DisplayKVM also repairs the *state* without any DDC (the monitor's own
+input auto-switch moves the picture, see below):
+
+- **A controller loses the display.** A node in `control` that the state says owns a display, but that no longer sees
+  it (for example the cable was unplugged), records `owner = home` and tells the others, without sending DDC. This only
+  applies when the home node cannot switch the display itself, and it is checked 2 seconds after a screen
+  configuration change and on every heartbeat. It does not fire while this node mirrors the display itself, while a
+  release or a claim of it is in progress, or just after the mirror was stopped.
+- **Every controller is gone.** On the home node, when the recorded owner is not alive and no node in `control` is
+  alive (they have been silent for 3 heartbeat intervals, so about 90 to 120 seconds), the home node takes the
+  ownership in the state, again without DDC. This is what removes the mirror after a controller crashed or went off
+  the network.
+
+**Keep the monitor's Auto-Switch Input (the OSD option, whatever it is called on your model) enabled.** It is the
+safety net behind both repairs: when the controller's cable is disconnected the monitor falls back to the other
+input by itself. It reacts to an unplugged cable or lost signal, **not** to the controlling Mac putting its screen to
+sleep.
+
+Update every Mac to the same release together: a node from 0.1.x does not know `control` and may still send its DDC
+commands or `request`s to a node that cannot handle them. Such a `request` is answered with `not-capable`.
+
 ## How it works
 
 Every Mac replicates a small state with last-writer-wins registers: who owns which display, and which Macs are
@@ -180,6 +243,19 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
 
 - Always-visible displays cannot be verified after a switch: if a monitor stays in `hs.screen.allScreens()` when
   it shows another input, DisplayKVM cannot tell whether a switch worked.
+- A controller that hangs with the cable still plugged in leaves the monitor on that input, asleep: there is no
+  automatic switch (the monitor's Auto-Switch Input reacts to a lost signal, not to the screen going to sleep).
+  After a minute or two the home node corrects the state and removes its mirror, but the picture only comes back
+  when you switch the input with the monitor's buttons or unplug the cable.
+- `whenAway` uses macOS-wide display mirroring, which briefly reconfigures the displays (the layout flickers and
+  windows are rearranged).
+- A port without DDC cannot be diagnosed from that Mac: the HDMI port of a Mac mini M1 has no working DDC and
+  `m1ddc` reports success anyway (check by observing `set input`, not `get`). List only Macs that can switch the
+  monitor in `control`.
+- Mirror recovery after a crash, or a Hammerspoon reload without `stop()`, is a heuristic: a `whenAway` display
+  that is missing from the screens at start is assumed to have been mirrored by the previous run. It is
+  un-mirrored the first moment this node owns the display (with a 5 second grace period while the owner is not
+  known yet).
 - DDC from a Mac whose input is not active is firmware-dependent; some monitors ignore it (use `pull = false`).
 - Clocks must be NTP-synchronised (messages older than 30 s are rejected).
 - LAN only, and macOS only.
@@ -196,7 +272,9 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
   - `displays[id] = { owner, visible, input }`: `owner` is the Mac the state says has the display (`nil` if unknown);
     `visible` is whether *this* Mac currently sees the monitor; `input` is this Mac's DDC input for it.
 - **Logs:** the logger is named `DisplayKVM`. Raise detail with `logLevel = "debug"` in `configure`.
-- **The monitor flips back by itself:** disable the monitor's automatic input selection in its OSD menu.
+- **The monitor flips back by itself:** disable the monitor's automatic input selection in its OSD menu. The exception
+  is a setup that uses `control` / `whenAway` for a port without DDC: keep it enabled there (see
+  [Monitors that a Mac cannot control](#monitors-that-a-mac-cannot-control)).
 - **Clamshell mode** (laptop closed with an external display): set `activity.lid = false`, otherwise closing the
   lid releases the displays.
 - **The monitor ignores a claim** while showing another input: set `pull = false` on that display.

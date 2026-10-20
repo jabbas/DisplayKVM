@@ -1,6 +1,6 @@
 # DisplayKVM — design
 
-- **Status:** Approved, 2026-10-12
+- **Status:** Approved, 2026-10-12; extended for 0.2.0 (`control`, `whenAway` mirror, state recovery without DDC — §5, §7.4, §9, §10, §13)
 - **Scope:** a Hammerspoon Spoon that shares M external monitors between N Macs
 
 ## 1. Summary
@@ -92,6 +92,7 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 | `Backend` | Common interface `setInput(display, input, done)`, always asynchronous through `hs.task` with a 5 s timeout. A synchronous variant, used only on `systemWillSleep` and when answering a peer's `request`, starts the task and polls `isRunning` until it ends or the limit (2 s on sleep, 3 s for a `request`) expires, then terminates it. Built-ins: `m1ddc`, `ddcctl`, `betterdisplay` (`betterdisplaycli`), `lunar`; or a user function `(display, input, done)`. A user function must call `done` before it returns: the synchronous variant cannot wait for a later call, treats a pending `done` as a failure and logs a one-time warning. | hs.task |
 | `Transport` | `hs.httpserver` serving `POST /v1/msg`, plus a client (`hs.http.asyncPost`). HMAC-SHA256 sign and verify; rejects stale and replayed messages. Request bodies are limited to 64 KiB. `hs.httpserver:start()` does not raise when it cannot listen, so `start()` checks `getPort()`; on failure it logs, the Spoon notifies "cannot listen on port <n>" and no node is kept. | hs.httpserver, hs.http, hs.hash |
 | `Discovery` | Publishes this node's Bonjour service, browses peers' services, merges in the static `peers` list. | hs.bonjour |
+| `Away` (`away.lua`, 0.2.0) | Hides a display from this node by mirroring it: `mirror(sourceUuid, targetUuid\|nil)` calls `screen:mirrorOf(target)` (target: the configured `mirrorTo`, else the primary screen, else the first other screen) and, after a 2 s settle delay, `window:setFrameInScreenBounds()` on every window to pull windows left half off the edge back inside the screen. `unmirror(targetUuid)` calls `mirrorStop()` on the **target** screen, as measured. `defaultTarget(excludeUuid)` tells where a mirror would go. The only code that uses these `hs` APIs; they come in through injected functions, so it is tested with fakes. | hs.screen, hs.window, hs.timer |
 
 `ActivitySensor` rules:
 
@@ -100,7 +101,9 @@ Principle: **decision logic is pure Lua with no `hs.*` calls**, so it can be uni
 - `screensDidLock` / `screensDidSleep` / `systemWillSleep` → `inactive`.
 - At start: unlocked and idle time < `startIdle` (30 s) → `active`; otherwise `inactive` with no action.
 
-Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `config.lua`, `message.lua`, `instances.lua`, `activity.lua`, `lid.lua`, `runner.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
+Files: `init.lua`, `node.lua`, `state.lua`, `policy.lua`, `config.lua`, `message.lua`, `instances.lua`, `activity.lua`, `lid.lua`, `runner.lua`, `display.lua`, `transport.lua`, `discovery.lua`, `away.lua`, `backends/*.lua`. The logger name is `DisplayKVM`.
+
+`Node` takes two optional dependencies added in 0.2.0: `away` (an `Away`, built by `init.lua` only when some display has `whenAway`) and `screenWatcher` (`hs.screen.watcher`, for the checks of §10 "State recovery without DDC"; `init.lua` always passes it). Without them `Node` behaves as in 0.1.x.
 
 ```d2
 direction: right
@@ -114,6 +117,7 @@ spoon: DisplayKVM.spoon {
   adapters: "Adapters (hs.*)" {
     activity: "ActivitySensor\nlock, wake, idle"
     lid: "LidSensor\nlid + debounce"
+    away: "Away\nmirrorOf / mirrorStop\nwindows back into bounds"
     display: "Display\nmatch, visible()"
     backend: "Backend\nm1ddc | ddcctl | betterdisplay | lunar\n(hs.task, async, timeout)"
     transport: "Transport\nHTTP server + client, HMAC"
@@ -125,6 +129,7 @@ spoon: DisplayKVM.spoon {
   adapters.activity -> node: "active / inactive"
   adapters.lid -> node: "lid open / closed"
   node -> adapters.display
+  node -> adapters.away: "mirror / unmirror"
   adapters.display -> adapters.backend: "setInput"
   node <-> adapters.transport: "messages"
   adapters.discovery -> adapters.transport: "peer list"
@@ -170,7 +175,7 @@ Messages are `POST /v1/msg` with a JSON body and the header `X-DisplayKVM-Sig: h
 |---|---|---|
 | `hello` | On start and when a new peer is discovered. A peer configured only by a static address is announced once, at start, so a `hello` is also re-sent on every heartbeat to each static address whose node name is not yet known, and when a message arrives from a node that cannot be routed to yet | The sender's full state. The reply is a signed `reply` envelope with the receiver's full state (two-way sync); it is also how a node learns the name behind a static address. |
 | `state` | After every local change and every `heartbeat` seconds (default 30) | Changed records or full state. Reply 204. |
-| `request` | A claim when pulling is not possible | `{display, to}` sent to the owner. The owner pushes. Reply `ok` or `failed`. |
+| `request` | A claim when pulling is not possible; a release by a node without DDC (0.2.0) | `{display, to}` sent to the owner (or, for a node outside `control`, to a live node in `control`). The receiver pushes the display to `to`, which may also be a node other than the sender. Reply `ok` or `failed`. |
 
 ### 7.3 Validation
 
@@ -189,6 +194,8 @@ Any failure returns 401 with no details.
 - Otherwise send `request` to the recorded owner if it is alive and not this node; if there is no usable owner, or the owner is unreachable or replies `failed`, broadcast `request` to every alive peer. Whoever sees the display pushes; the first `ok` wins.
 - The pusher writes `owner = <requester>` after its switch succeeded and broadcasts it. The requester writes `owner = self` after `ok` (or after its own pull succeeded). Both records name the same node, so LWW merges them cleanly even if the reply is lost.
 - Each attempt — pull, request, broadcast, or a failed post-switch verification — counts towards the limit of 5 attempts per claim (§10).
+- **`control` (0.2.0).** A node outside the display's `control` list never pulls and never runs the backend for it. Its claim sends a `request` to the recorded owner when that is alive and in `control`, otherwise to every live node in `control`. The same goes for its releases: it sends `request {display, to = target}` to the live nodes in `control` one after the other (the owner first if it is one, otherwise by name) and the first `ok` wins. A node in `control` handles such a request on the existing path (`switchToSync(to)`) even when `to` is not itself. A node outside `control` that receives a `request` — only possible from a 0.1.x peer that does not know `control` — answers `failed` with the reason `not-capable` and sends nothing to the backend. If no node in `control` is alive, the claim or release logs the problem and nothing is switched; §10 describes how the state is repaired.
+- **Sticky monitors and the 3 s verification.** A monitor that stays visible on every input cannot be verified by `visible()`, so a node that mirrors it (`whenAway`) skips the post-`request` verification: the display is hidden by its own mirror and visibility says nothing about the monitor.
 
 ### 7.5 Release flow
 
@@ -256,6 +263,9 @@ spoon.DisplayKVM:bindHotkeys({ claim = { { "ctrl", "alt", "cmd" }, "M" } })  -- 
 | `displays.<id>.inputs` | yes | — | `{node = DDC input}`. A node without an entry does not take part in that display. |
 | `displays.<id>.home` | no | first node in `inputs` | Release target when no other node is active. |
 | `displays.<id>.pull` | no | `true` | Set `false` for monitors that ignore DDC from an inactive input. Claims then always `request` the owner. |
+| `displays.<id>.control` | no | every node in `inputs` | Non-empty list of nodes that can switch this display over DDC; each must have an entry in `inputs`. A node outside it never calls the backend for the display (§7.4). Example: a Mac mini M1 whose HDMI port has no working DDC. |
+| `displays.<id>.whenAway` | no | — | `{node = "mirror"}` (the only value; every node must have an entry in `inputs`). That node mirrors the display while another node owns it (§10). |
+| `displays.<id>.mirrorTo` | no | primary screen | `{node = UUID}`: the screen that node mirrors onto. Default: the primary screen, or the first other screen when the display itself is primary. |
 | `port` | no | `8765` | Server port. |
 | `peers` | no | — | Static list of `"host:port"` in addition to Bonjour. |
 | `bonjour` | no | `true` | `false` disables discovery (static peers only). |
@@ -264,7 +274,7 @@ spoon.DisplayKVM:bindHotkeys({ claim = { { "ctrl", "alt", "cmd" }, "M" } })  -- 
 | `heartbeat` | no | `30` | Seconds between `state` heartbeats. A node is absent after 3 silent intervals. |
 | `logLevel` | no | `"info"` | Level of the `DisplayKVM` logger. |
 
-**Validation.** `configure()` checks the schema: the node appears in some `inputs`, `home` has an input, the secret is long enough, and the binary of a built-in backend exists. On error it logs, shows a macOS notification, and `start()` does nothing.
+**Validation.** `configure()` checks the schema: the node appears in some `inputs`, `home` has an input, `control` is a non-empty list of nodes that have an input, `whenAway` and `mirrorTo` only name such nodes (and `whenAway` only `"mirror"`), the secret is long enough, and the binary of a built-in backend exists. On error it logs, shows a macOS notification, and `start()` does nothing.
 
 **`status()`** returns `{ node, instance, peers, displays }`. `peers[name]` is `{ lastSeen, active, alive }`: the time of the last verified message, the peer's replicated presence (`false` when inactive, `nil` when unknown) and whether it was heard from within 3 heartbeat intervals. `displays[id]` is `{ owner, visible, input }`: the recorded owner, whether this Mac currently sees the monitor, and this node's DDC input.
 
@@ -291,10 +301,21 @@ General rule: state is always repairable by the next event. Everything is logged
 | Start / reload | The sensors are read first (unlocked and idle < `startIdle` → active, otherwise inactive) and the node's own presence is set; then discovery starts and `hello` is sent to every peer found. If the node is active it then claims. Otherwise ownership is learned from the peers' replies. Static peers are greeted once at start; if a static peer starts later, `hello` is re-sent on the heartbeat until the peer's name is learned, and also as soon as a message arrives from it. |
 | Port already in use | `Transport:start` detects that the server is not listening, logs an error and `start()` shows the notification "DisplayKVM: cannot listen on port <n>". Nothing else is started and no half-started node is kept. |
 | Garbage collection | All watchers, timers and the server are fields of `Node`, held by `spoon.DisplayKVM`. No globals. |
+| Mirror while another node owns the display (`whenAway`, 0.2.0) | After every change of the owner records (and at start, after the first state from a peer) `Node` compares "another node owns the display" with "this node has it mirrored" and acts only on a real change, so a heartbeat or a repeated `hello` with the same owner does nothing. `Away:mirror` hides the display, 2 s later pulls the windows back into bounds. Writing `owner = me` removes the mirror at once, in the same call, so a node that takes the display (its own claim, or a request it answers) is not left mirrored; the post-`request` verification is skipped for such a display (§7.4). `stop()` removes every mirror. Info-level log on both changes. |
+| Mirror left behind by a previous run (reload without `stop()`, crash) | macOS keeps the mirror, so at start a `whenAway` display that is missing from the screens is assumed to be mirrored: the mirror is recorded (target: `mirrorTo`, else the default target), and it is removed the first time this node wants its own screens. After a reload the state is empty, so an unknown owner gets a 5 s grace period (or until the first peer state arrives) before it counts as "mine". A mirror that cannot be started or stopped (`mirrorOf` / `mirrorStop` fail, or the screen is not found) is logged once as a warning and retried on the next state change. This is a heuristic; the cases it gets wrong are harmless (a `mirrorStop` on a layout that is not mirrored). |
+| **State recovery without DDC (R3a)**: a controller loses the display | The node is in `control`, the state says it owns the display, the home node is not in `control` (cannot switch it itself), no claim of this node is live, no release is in flight, it does not mirror the display itself, and `visible()` is false: the monitor's Auto-Switch Input moved to the home input after the cable went away (the monitor does not react to the Mac sleeping its screen). The node writes `owner = home` **without DDC** and broadcasts it. Checked 2 s after the last screen configuration change (`hs.screen.watcher`, debounced) and, as a backup, on every heartbeat. Not within 2 s of stopping a mirror, because the screen may take a moment to be listed again. |
+| **State recovery without DDC (R3b)**: every controller is gone | On the home node, which is outside `control`: the recorded owner is not alive and no node in `control` is alive (silent for 3 heartbeat intervals, so within roughly 90 to 120 seconds, as the check runs on the heartbeat). The home node writes `owner = me` without DDC, which also removes its mirror. Only the home node does this, so two nodes cannot fight over it. |
+| Hang of a controller with the cable plugged in | The monitor keeps its input and goes to sleep with the controller's screen; the monitor's Auto-Switch Input is not triggered. R3b fixes the state and the mirror after a minute or two, but the picture does not come back until the user switches the input on the monitor. Documented limitation. |
 
 **Documented limitations:**
 
 - Always-visible displays cannot be verified after a switch.
+- A port without DDC cannot be diagnosed from that Mac: the HDMI port of a Mac mini M1 has no working DDC, and `m1ddc` reports success (status 0) anyway. Check by observing `set input`, not `get`, and keep such a node out of `control`. DDC reads (`get input`) from a Mac are stale after a switch and are not used.
+- A controller that hangs with the cable plugged in leaves the monitor asleep; there is no automatic switch.
+- `whenAway` relies on macOS-wide display mirroring, which briefly reconfigures all the displays (layout flicker, windows rearranged).
+- Mirror recovery after a crash is a heuristic (see the table above).
+- `hs.window` has no `ensureIsInScreenBounds`; the windows are pulled back with `setFrameInScreenBounds()` without a rectangle, which re-applies the current frame fitted to the screen.
+- A 0.1.x node does not know `control`: update all nodes together.
 - Clocks must be NTP-synced.
 - LAN only.
 - macOS only.
@@ -304,7 +325,7 @@ General rule: state is always repairable by the next event. Everything is logged
 | Level | What | How |
 |---|---|---|
 | Unit (pure Lua) | State merge (LWW, ties, idempotence, commutativity). Policy (target selection, stale presence, home fallback, home == self, node without input). Config validation. Message envelope (sign/verify, time window, replayed nonce). | `busted`. Clock, randomness and HMAC are injected, so no Hammerspoon is needed. |
-| Node scenarios | Full flows on fakes of Transport, Display and the sensors: unlocking a laptop makes the laptop the owner; locking it returns the display to home; the home waking while the laptop is unlocked takes the display back; reload rules; three nodes with "last active"; owner unreachable → broadcast fallback; two simultaneous claims. | `busted` plus minimal `hs` fakes in `spec/support/`. |
+| Node scenarios | Full flows on fakes of Transport, Display and the sensors: unlocking a laptop makes the laptop the owner; locking it returns the display to home; the home waking while the laptop is unlocked takes the display back; reload rules; three nodes with "last active"; owner unreachable → broadcast fallback; two simultaneous claims. Since 0.2.0 also with a sticky monitor and a node without DDC (`spec/support/sim.lua`): `control` routing and `not-capable`, the mirror at start / reload / `stop()` and its idempotence, R3a and R3b. `Away` is tested with fake screens and windows. | `busted` plus minimal `hs` fakes in `spec/support/`. |
 | Static | Unused variables, accidental globals. | `luacheck` |
 | CI | All of the above on every push. | GitHub Actions (Lua 5.4, `busted`, `luacheck`) |
 | Hardware (manual) | Pre-check spike: does the monitor disappear from `hs.screen.allScreens()` after switching away, on each Mac? Then acceptance: the scenarios above, plus Wi-Fi off on the laptop (fallback), the hotkey, and `status()`. | Checklist, human, and logs. |
@@ -316,7 +337,7 @@ The **repository root is the Spoon**, so the repo can be cloned directly into `S
 ```
 init.lua  node.lua  state.lua  policy.lua  config.lua  message.lua
 instances.lua  activity.lua  lid.lua  runner.lua  display.lua
-transport.lua  discovery.lua
+transport.lua  discovery.lua  away.lua
 backends/            -- m1ddc, ddcctl, betterdisplay, lunar
 tools/               -- build-dist.sh (release zip), gen-docs-json.lua (SpoonInstall metadata)
 spec/                -- busted specs; spec/support/ holds the hs fakes
@@ -337,6 +358,8 @@ The repository must never contain secrets, a user's UUIDs or hostnames, or anyth
 Points the first draft left implicit, now decided:
 
 1. **Nonce cache retention.** A nonce is kept for 60 s (the full span in which a message with that timestamp can pass the ±30 s window), then evicted.
-2. **Replies.** Validation failures return 401 with an empty body. Accepted `hello` returns 200 with the receiver's full state; accepted `state` returns 204; accepted `request` returns 200 with a result. Replies that carry a body are signed `reply` envelopes (§7.1) with `X-DisplayKVM-Sig`, verified by the requester like any other message, so a reply cannot be forged and also counts as contact with the replying node. The `hello` body is `{"state": ...}`; the `request` body is `{"result": "ok"}` or `{"result": "failed", "reason": "<short text>"}` (e.g. `not-visible`, `backend-error`, `unknown-display`).
+2. **Replies.** Validation failures return 401 with an empty body. Accepted `hello` returns 200 with the receiver's full state; accepted `state` returns 204; accepted `request` returns 200 with a result. Replies that carry a body are signed `reply` envelopes (§7.1) with `X-DisplayKVM-Sig`, verified by the requester like any other message, so a reply cannot be forged and also counts as contact with the replying node. The `hello` body is `{"state": ...}`; the `request` body is `{"result": "ok"}` or `{"result": "failed", "reason": "<short text>"}` (e.g. `not-visible`, `backend-error`, `unknown-display`, and since 0.2.0 `not-capable`: the receiver is outside the display's `control`).
 3. **When `owner` is written.** Always after the switch succeeded — for claims and releases alike. On `systemWillSleep` the synchronous backend call returns before sleep, so `owner = target` is written immediately after it; only the broadcast of that change is best-effort.
 4. **Default of `pull`.** The Spoon default stays `true`. A user whose hardware pre-check shows the monitor ignores DDC from an inactive input sets `pull = false` for that display.
+5. **0.2.0 field names and values.** `control` (list of nodes), `whenAway` (`{node = "mirror"}`) and `mirrorTo` (`{node = UUID}`) per display; the new `request` reply reason is `not-capable`; the settle delay before windows are pulled back after a mirror is 2 s; the debounce of the R3a check after a screen change is 2 s; R3a and R3b also run on every `heartbeat`. Mirroring is decided from the replicated state only — not by guessing the monitor's physical input, which a sticky monitor does not reveal.
+6. **Releasing earlier.** A controller that is closing its lid or locking hands the display over on `screensDidLock` / sleep as before; there is no extra `screensWillSleep` hook (`hs.caffeinate.watcher` offers `screensDidSleep` and `systemWillSleep`, which are already used). Whether the hand-over finishes before the monitor goes to sleep has to be checked on the real hardware.

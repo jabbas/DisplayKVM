@@ -20,7 +20,9 @@ describe("Away", function()
 
   local function window(fails)
     local w = { ensured = 0 }
-    function w:ensureIsInScreenBounds()
+    -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() without a rect re-applies the
+    -- current frame, clamped to the screen.
+    function w:setFrameInScreenBounds()
       self.ensured = self.ensured + 1
       if fails then error("window gone") end
     end

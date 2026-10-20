@@ -16,7 +16,7 @@
 --   settle    seconds to wait after a mirror before pulling the windows back into bounds (default 2)
 -- Methods: mirror(sourceUuid, targetUuid|nil) -> ok, usedUuid; unmirror(targetUuid) -> ok;
 -- defaultTarget(excludeUuid|nil) -> uuid|nil.
--- A `screen` has :getUUID() :mirrorOf(other) -> bool :mirrorStop() -> bool; a `window` :ensureIsInScreenBounds().
+-- A `screen` has :getUUID() :mirrorOf(other) -> bool :mirrorStop() -> bool; a `window` :setFrameInScreenBounds().
 
 local Away = {}
 Away.__index = Away
@@ -71,7 +71,9 @@ end
 function Away:_pullWindowsBack()
   self._settleTimer = nil
   for _, window in ipairs(self._windows()) do
-    local ok, err = pcall(window.ensureIsInScreenBounds, window)
+    -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() with no rect re-applies the
+    -- window's current frame, adjusted to lie fully inside its screen.
+    local ok, err = pcall(window.setFrameInScreenBounds, window)
     if not ok then self._log.d("could not move a window back into bounds: " .. tostring(err)) end
   end
 end
