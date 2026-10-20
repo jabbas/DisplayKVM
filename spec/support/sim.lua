@@ -23,6 +23,9 @@
 --                 Like the real Discovery, a static address is announced (onUp) only when the node
 --                 itself starts, never when the peer behind it starts later.
 --   lid          true enables the lid sensor in the node config
+--   whenAway, mirrorTo   the display options of the same name (node -> "mirror" / screen uuid); every
+--                 node gets a fake `away` whose mirror hides the display from that node (fact F8:
+--                 the screen leaves allScreens). sim.mirrorFails[name] = true makes its mirror() fail.
 --
 -- DDC: sim.ddcLatency (seconds, default 0.1) is how long an async switchTo takes; sim.ddcApply = "end"
 --   (default) applies the command when it completes, "start" applies it at once and only reports later.
@@ -37,7 +40,8 @@
 --   sim.monitor (commands, applied, stuck, failing), sim.counts[name] = {switchTo, switchToSync, sendSync,
 --   broadcastSync, cancel}, sim.messages (every send), sim:sent{from=,to=,type=}, sim.notifications,
 --   sim:notified(kind, node), sim:ddcCalls(name) (switchTo/switchToSync calls that reached the backend of a
---   noDdc node).
+--   noDdc node), sim:mirrored(name) (the node mirrors the display now), sim:mirrorCalls(name) = {mirror, unmirror}
+--   (calls of the fake away, cumulative over restarts), sim.logLines ("<node> <level> <message>").
 
 local fakes = dofile("spec/support/fakes.lua")
 local State = dofile("state.lua")
@@ -98,7 +102,12 @@ local function newDisplay(sim, node, id, spec)
   local d = { id = id, pull = spec.pull, home = spec.home }
 
   function d:inputFor(n) return spec.inputs[n] end
-  function d:visible() return sim.monitor:visibleTo(node) end
+  -- Fact F8: a mirrored screen disappears from the screens of the node that mirrors it.
+  function d:visible() return sim.monitor:visibleTo(node) and not sim.mirroring[node] end
+  function d:target()
+    if not self:visible() then return nil end
+    return { uuid = "UUID-" .. id, name = id }
+  end
 
   function d:switchTo(target, done)
     counts.switchTo = counts.switchTo + 1
@@ -284,7 +293,7 @@ function Sim:_build(name)
 
   local displaySpec = {
     inputs = self.monitor.inputs, home = self.home, pull = self.pull, match = self.displayId,
-    control = self.control,
+    control = self.control, whenAway = self.whenAway, mirrorTo = self.mirrorTo,
   }
   local cfg = {
     node = name,
@@ -292,6 +301,21 @@ function Sim:_build(name)
     activity = { userIdle = 5, startIdle = 30, lid = self.lidEnabled },
     displays = { [self.displayId] = displaySpec },
   }
+
+  -- The fake `away`: mirroring flips sim.mirroring[name] (which hides the display from that node).
+  local away = {}
+  function away.mirror(_, sourceUuid, targetUuid)
+    self.mirrorCount[name].mirror = self.mirrorCount[name].mirror + 1
+    if self.mirrorFails[name] then return false end
+    assert(sourceUuid == "UUID-" .. self.displayId, "mirror of an unexpected screen: " .. tostring(sourceUuid))
+    self.mirroring[name] = true
+    return true, targetUuid or "UUID-primary"
+  end
+  function away.unmirror(_, _)
+    self.mirrorCount[name].unmirror = self.mirrorCount[name].unmirror + 1
+    self.mirroring[name] = false
+    return true
+  end
 
   entry.resolve = newResolver(self, entry)
   entry.transport = newTransport(self, entry)
@@ -338,6 +362,7 @@ function Sim:_build(name)
     discovery = entry.discovery,
     activity = activity,
     lid = lid,
+    away = away,
     now = self.now,
     timer = self.timer,
     log = log,
@@ -377,6 +402,9 @@ function Sim.new(opts)
   for _, node in ipairs(opts.monitor.noDdc or {}) do self.noDdc[node] = true end
   for _, node in ipairs(opts.nodes) do self.ddcCount[node] = 0 end
   self.lidEnabled = opts.lid == true
+  self.whenAway, self.mirrorTo = opts.whenAway, opts.mirrorTo
+  self.mirroring, self.mirrorCount, self.mirrorFails = {}, {}, {}
+  for _, node in ipairs(opts.nodes) do self.mirrorCount[node] = { mirror = 0, unmirror = 0 } end
   self.monitor = newMonitor({
     inputs = opts.monitor.inputs,
     mode = opts.monitor.mode,
@@ -475,6 +503,10 @@ function Sim:sent(filter)
 end
 
 function Sim:ddcCalls(name) return self.ddcCount[name] or 0 end
+
+-- Whether `name` mirrors the display right now, and how many times it asked to start or stop.
+function Sim:mirrored(name) return self.mirroring[name] == true end
+function Sim:mirrorCalls(name) return self.mirrorCount[name] end
 
 function Sim:notified(kind, node)
   local n = 0

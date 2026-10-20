@@ -30,6 +30,16 @@ end
 
 local function requests(sim, from) return #sim:sent({ from = from, type = "request" }) end
 
+-- Log messages of `node` at `level` that contain `text` (plain match).
+local function logged(sim, node, level, text)
+  local out = {}
+  for _, line in ipairs(sim.logLines) do
+    local who, lvl, msg = line:match("^(%S+) (%a) (.*)$")
+    if who == node and lvl == level and msg:find(text, 1, true) then out[#out + 1] = msg end
+  end
+  return out
+end
+
 local function allOwners(sim, nodes, expected)
   for _, n in ipairs(nodes) do assert.equal(expected, sim:owner(n), "owner as seen by " .. n) end
 end
@@ -939,6 +949,9 @@ describe("control (nodes without DDC)", function()
     assert.equal(17, sim:input())
     sim:lock("studio")
     sim:advance(1)
+    -- studio's release was delegated to the laptop and went to the latest active peer
+    assert.equal(15, sim:input())
+    allOwners(sim, { "desk-mini", "laptop", "studio" }, "desk-mini")
     sim:lock("desk-mini")
     sim:advance(1)
     -- desk-mini holds no DDC and the best peer is laptop (still active)
@@ -1002,7 +1015,7 @@ describe("control (nodes without DDC)", function()
     assert.equal(21, sim:input())
   end)
 
-  it("a delegated release that the controller refuses leaves the owner alone and logs an error", function()
+  it("a delegated release that the controller refuses leaves the owner alone and logs a warning", function()
     local sim = laptopOwns()
     sim:activate("desk-mini")
     sim:advance(1)
@@ -1012,6 +1025,66 @@ describe("control (nodes without DDC)", function()
     assert.equal(17, sim:input())
     assert.equal("desk-mini", sim:owner("desk-mini"))
     assert.same({}, sim:node("desk-mini").releasing)
+    local warnings = logged(sim, "desk-mini", "w", "cannot hand over left")
+    assert.equal(1, #warnings)
+    assert.truthy(warnings[1]:find("laptop", 1, true))
+    assert.truthy(warnings[1]:find("backend-error", 1, true))
+    assert.same({}, logged(sim, "desk-mini", "i", "already handed over"))
+    assert.same({}, logged(sim, "desk-mini", "e", "release of left failed"))
+  end)
+
+  it("a delegated release with no capable peer alive warns once per inactivity event", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:partition("laptop", true)
+    sim:lock("desk-mini")
+    sim:lock("desk-mini") -- the same event again while the first release is still in flight
+    sim:advance(1)
+    local warnings = logged(sim, "desk-mini", "w", "cannot hand over left")
+    assert.equal(1, #warnings)
+    assert.same({}, logged(sim, "desk-mini", "i", "already handed over"))
+    assert.same({}, logged(sim, "desk-mini", "e", "release of left failed"))
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+  end)
+
+  it("a delegated release with every controller gone for good warns about it in its own words", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop", "studio" }, home = "desk-mini",
+      monitor = {
+        inputs = ALL_INPUTS, mode = "sticky", acceptsInactive = true, input = 15,
+        control = { "laptop" }, noDdc = { "desk-mini", "studio" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:activate("studio")
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(1)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    sim:partition("laptop", true)
+    sim:advance(100) -- the laptop is no longer alive, studio still is
+    sim:lock("desk-mini")
+    sim:advance(1)
+    local warnings = logged(sim, "desk-mini", "w", "cannot hand over left")
+    assert.equal(1, #warnings)
+    assert.truthy(warnings[1]:find("no node with control", 1, true))
+    assert.same({}, logged(sim, "desk-mini", "i", "already handed over"))
+  end)
+
+  it("a successful delegated release logs no misleading 'landed but' line", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:lock("desk-mini")
+    sim:advance(2)
+    assert.equal(21, sim:input())
+    assert.equal("laptop", sim:owner("desk-mini"))
+    assert.same({}, logged(sim, "desk-mini", "i", "landed but"))
+    assert.same({}, logged(sim, "desk-mini", "w", "cannot hand over"))
   end)
 
   it("a delegated release landing after desk-mini became active again claims afresh", function()
@@ -1061,5 +1134,163 @@ describe("control (nodes without DDC)", function()
     sim:advance(1)
     assert.same({ "desk-mini", "laptop" }, sim:node("laptop"):status().displays.left.control)
     assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("status() falls back to the sorted input nodes exactly like _canSwitch when control is missing", function()
+    local sim = make({ nodes = { "laptop", "studio", "desk-mini" } })
+    local node = sim:node("laptop")
+    node.cfg.displays.left.control = nil
+    local reported = node:status().displays.left.control
+    assert.same({ "desk-mini", "laptop", "studio" }, reported)
+    for _, name in ipairs({ "desk-mini", "laptop", "studio" }) do
+      assert.is_true(node:_canSwitch("left", name))
+    end
+  end)
+end)
+
+-- R2: a node without the display mirrors it onto another of its screens while another node owns it.
+-- Same setup as "control": desk-mini has no DDC, the laptop controls the monitor.
+describe("whenAway mirror", function()
+  local function makeMirror(o)
+    o = o or {}
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = o.whenAway == nil and { ["desk-mini"] = "mirror" } or o.whenAway or nil,
+      mirrorTo = o.mirrorTo,
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    return sim
+  end
+
+  local function laptopOwns(o)
+    local sim = makeMirror(o)
+    sim:activate("laptop")
+    sim:advance(1)
+    return sim
+  end
+
+  it("M1 laptop takes the display: desk-mini mirrors", function()
+    local sim = laptopOwns()
+    assert.equal(21, sim:input())
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.is_false(sim:mirrored("laptop"))
+    assert.is_true(sim:node("desk-mini"):status().displays.left.mirrored)
+    assert.is_false(sim:node("laptop"):status().displays.left.mirrored)
+    assert.equal(1, #logged(sim, "desk-mini", "i", "mirroring left (owned by laptop)"))
+  end)
+
+  it("M2 laptop locks: desk-mini stops mirroring", function()
+    local sim = laptopOwns()
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, #logged(sim, "desk-mini", "i", "left is back, mirror stopped"))
+  end)
+
+  it("M3 desk-mini claims via request: mirror stops at once and no retry follows", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(10)
+    assert.equal(17, sim:input())
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, requests(sim, "desk-mini"))
+    assert.equal(0, sim:notified("claim-failed"))
+  end)
+
+  it("M3b a display that stays out of sight does not make the verification retry the claim", function()
+    local sim = laptopOwns()
+    -- the monitor 'disappears' from allScreens() while the screen is mirrored
+    sim:node("desk-mini").displays.left.visible = function() return false end
+    sim:activate("desk-mini")
+    sim:advance(10)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.equal(1, requests(sim, "desk-mini"))
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({}, sim:node("desk-mini").intents)
+    assert.same({}, logged(sim, "desk-mini", "w", "not visible"))
+  end)
+
+  it("M4 heartbeats and hellos with an unchanged owner do not toggle the mirror", function()
+    local sim = laptopOwns()
+    sim:hello("laptop")
+    sim:hello("desk-mini")
+    sim:advance(120)
+    assert.equal(1, sim:mirrorCalls("desk-mini").mirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.is_true(sim:mirrored("desk-mini"))
+  end)
+
+  it("M5 stop() stops the mirror", function()
+    local sim = laptopOwns()
+    assert.is_true(sim:mirrored("desk-mini"))
+    sim:node("desk-mini"):stop()
+    assert.is_false(sim:mirrored("desk-mini"))
+  end)
+
+  it("M5b stop() without a mirror asks for nothing", function()
+    local sim = makeMirror()
+    sim:node("desk-mini"):stop()
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
+  it("M6 restart learns the owner from hello and mirrors", function()
+    local sim = laptopOwns()
+    sim:restart("desk-mini")
+    sim:advance(1)
+    assert.is_true(sim:mirrored("desk-mini"))
+  end)
+
+  it("M7 no whenAway: never mirrors", function()
+    local sim = laptopOwns({ whenAway = false })
+    assert.equal(21, sim:input())
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_false(sim:mirrored("desk-mini"))
+  end)
+
+  it("M8 mirrorTo is handed to the adapter and remembered for the unmirror", function()
+    local sim = laptopOwns({ mirrorTo = { ["desk-mini"] = "UUID-secondary" } })
+    assert.equal("UUID-secondary", sim:node("desk-mini").mirrored.left)
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.is_nil(sim:node("desk-mini").mirrored.left)
+  end)
+
+  it("M9 a failed mirror is retried on the next state, warned about once per owner", function()
+    local sim = makeMirror()
+    sim.mirrorFails["desk-mini"] = true
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:advance(95) -- several heartbeats with the same owner
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.is_true(sim:mirrorCalls("desk-mini").mirror > 1)
+    assert.equal(1, #logged(sim, "desk-mini", "w", "cannot mirror left"))
+    sim.mirrorFails["desk-mini"] = false
+    sim:advance(31)
+    assert.is_true(sim:mirrored("desk-mini"))
+  end)
+
+  it("M10 the display is not visible to the node yet: no mirror, no error", function()
+    local sim = makeMirror()
+    sim:node("desk-mini").displays.left.target = function() return nil end
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_false(sim:mirrored("desk-mini"))
+  end)
+
+  it("M11 after the mirror is stopped, further states do not stop it again", function()
+    local sim = laptopOwns()
+    sim:lock("laptop")
+    sim:advance(1)
+    sim:advance(60)
+    assert.equal(1, sim:mirrorCalls("desk-mini").mirror)
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
   end)
 end)

@@ -5,7 +5,9 @@
 --
 -- cfg: the validated Config table. Used fields: node (this node's name), heartbeat (seconds),
 --   displays[id].inputs (read by Policy), displays[id].control (nodes that may run DDC for the display;
---   a node outside it switches through a peer inside it), activity.lid (boolean), plus whatever Policy reads from it.
+--   a node outside it switches through a peer inside it), displays[id].whenAway[node] ("mirror": that node
+--   mirrors the display onto another screen while another node owns it), displays[id].mirrorTo[node] (uuid of
+--   the screen to mirror onto), activity.lid (boolean), plus whatever Policy reads from it.
 --
 -- deps (all required unless marked optional):
 --   state      State object (:setOwner :setPresence :owner :presence :merge :snapshot)
@@ -21,6 +23,8 @@
 --   discovery  Discovery: :start(onUp(name), onDown(name)) :stop() :names() :resolve(name)
 --              :unaliased(isAlive) -> static addresses whose node name is not learned yet
 --   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
+--   away       optional Away (away.lua): :mirror(sourceUuid, targetUuid|nil) -> ok, usedTargetUuid
+--              :unmirror(targetUuid) -> ok; used only for displays with cfg.displays[id].whenAway[me] == "mirror"
 --   lid        optional LidSensor: :start(onChange(closed), onReady(closed|nil)) :stop() :closed(); used only if
 --              cfg.activity.lid. onReady fires once, after the asynchronous first read of the lid state
 --   now        function() -> integer milliseconds (also the clock for State timestamps)
@@ -62,6 +66,7 @@ function Node.new(cfg, deps)
   self.discovery = deps.discovery
   self.activity = deps.activity
   self.lid = deps.lid
+  self.away = deps.away
   self.now = deps.now
   self.timer = deps.timer
   self.log = deps.log or { d = noop, i = noop, w = noop, e = noop }
@@ -70,6 +75,8 @@ function Node.new(cfg, deps)
   self.lastNotified = {}  -- kind -> ms
   self.intents = {}       -- display id -> claim intent
   self.releasing = {}     -- display id -> true while an async release switch is in flight
+  self.mirrored = {}      -- display id -> uuid of the screen it is mirrored onto (whenAway)
+  self.mirrorWarned = {}  -- display id -> owner for which a failed mirror was already warned about
   self.active = false
   self.lidClosed = false
   self.running = false
@@ -115,7 +122,55 @@ function Node:_writeOwner(id, node)
   local ts = self.now()
   local current, currentTs = self.state:owner(id)
   if current == self.me and currentTs >= ts then ts = currentTs + 1 end
-  return self.state:setOwner(id, node, ts)
+  local changed = self.state:setOwner(id, node, ts)
+  self:_syncAway()
+  return changed
+end
+
+-- ---------------------------------------------------------------- whenAway mirror
+
+-- For every display with whenAway[me] == "mirror": mirrored exactly while another node owns it. Called
+-- after every change of the owner records, and it acts only on a real change (a heartbeat or hello with
+-- the same owner does nothing), so the mirror is never toggled in a loop.
+function Node:_syncAway()
+  if self.away == nil or not self.running then return end
+  for id, d in pairs(self.cfg.displays) do
+    if d.whenAway ~= nil and d.whenAway[self.me] == "mirror" and self.displays[id] ~= nil then
+      local owner = self.state:owner(id)
+      local want = owner ~= nil and owner ~= self.me
+      if want and self.mirrored[id] == nil then
+        self:_startMirror(id, owner, d.mirrorTo and d.mirrorTo[self.me])
+      elseif not want and self.mirrored[id] ~= nil then
+        self:_stopMirror(id)
+      end
+    end
+  end
+end
+
+function Node:_startMirror(id, owner, targetUuid)
+  local source = self.displays[id]:target()
+  if source == nil then
+    return self.log.d("not mirroring " .. id .. " (owned by " .. owner .. "): display not among the screens")
+  end
+  local ok, used = self.away:mirror(source.uuid, targetUuid)
+  if not ok then
+    if self.mirrorWarned[id] ~= owner then
+      self.mirrorWarned[id] = owner
+      self.log.w("cannot mirror " .. id .. " (owned by " .. owner .. "), will retry on the next state change")
+    end
+    return
+  end
+  self.mirrorWarned[id] = nil
+  self.mirrored[id] = used
+  self.log.i("mirroring " .. id .. " (owned by " .. owner .. ")")
+end
+
+function Node:_stopMirror(id)
+  if not self.away:unmirror(self.mirrored[id]) then
+    return self.log.w("cannot stop mirroring " .. id .. ", will retry on the next state change")
+  end
+  self.mirrored[id] = nil
+  self.log.i(id .. " is back, mirror stopped")
 end
 
 function Node:_stateBody()
@@ -239,14 +294,16 @@ function Node:_controlTargets(id)
 end
 
 -- Switches display `id` to `target` through a capable peer: sends `request {display, to = target}` to the
--- targets of _controlTargets one after the other; the first ok wins. cb(true), or cb(false, reason) when
--- there is no target or all of them refused or did not answer.
+-- targets of _controlTargets one after the other; the first ok wins. cb(true), or cb(false, reason, peer)
+-- when there is no target ("no-controller") or all of them refused or did not answer (the reason and the
+-- name of the last one).
 function Node:_delegate(id, target, cb)
   local targets = self:_controlTargets(id)
-  local function try(i)
+  local function try(i, lastPeer, lastWhy)
     if not self.running then return end
     local peer = targets[i]
     if peer == nil then
+      if lastPeer ~= nil then return cb(false, lastWhy, lastPeer) end
       self.log.d("no alive node with control to switch " .. id .. " to " .. tostring(target))
       return cb(false, "no-controller")
     end
@@ -255,7 +312,7 @@ function Node:_delegate(id, target, cb)
       if ok and type(reply) == "table" and reply.result == "ok" then return cb(true) end
       local why = type(reply) == "table" and reply.reason or status
       self.log.d("delegated switch of " .. id .. " via " .. tostring(peer) .. " failed: " .. tostring(why))
-      try(i + 1)
+      try(i + 1, peer, why)
     end)
   end
   try(1)
@@ -361,7 +418,10 @@ end
 function Node:_claimed(intent, viaRequest)
   self:_writeOwner(intent.id, self.me)
   self:_broadcast()
-  if not viaRequest then
+  -- A node that mirrors the display while it is away (whenAway) sees it reappear only after the mirror
+  -- is stopped; its visibility says nothing about the monitor, so there is nothing to verify after 3 s.
+  local away = self.cfg.displays[intent.id].whenAway
+  if not viaRequest or (away ~= nil and away[self.me] ~= nil) then
     self.intents[intent.id] = nil
     return
   end
@@ -477,6 +537,18 @@ function Node:_releaseFailed(id, why)
   self.log.e("release of " .. id .. " failed: " .. tostring(why))
 end
 
+-- A release handed to a capable peer did not happen: nobody with control is reachable, or the one that was
+-- asked refused or did not answer. Unlike _releaseFailed, "not-visible" here is the peer's, so it says
+-- nothing about this node having handed the display over. Called once per release, and releases are one in
+-- flight per display, so this warns at most once per inactivity event. The owner is left alone.
+function Node:_delegationFailed(id, target, why, peer)
+  local prefix = "cannot hand over " .. id .. " to " .. tostring(target) .. ": "
+  if why == "no-controller" then
+    return self.log.w(prefix .. "no node with control is reachable")
+  end
+  self.log.w(prefix .. tostring(peer) .. " did not do it (" .. tostring(why) .. ")")
+end
+
 -- Asynchronous release switch: through the own backend when this node may switch the display, otherwise
 -- delegated to a capable peer. done(ok, reason).
 function Node:_switchAway(id, target, done)
@@ -495,13 +567,19 @@ function Node:_releaseAsync(targets)
       self.log.d("release of " .. id .. " already in flight")
     else
       self.releasing[id] = true
-      self:_switchAway(id, t.target, function(ok, why)
+      local delegated = not self:_canSwitch(id, self.me)
+      self:_switchAway(id, t.target, function(ok, why, peer)
         self.releasing[id] = nil
         if not self.running then return end
-        if not ok then return self:_releaseFailed(id, why) end
+        if not ok then
+          if delegated then return self:_delegationFailed(id, t.target, why, peer) end
+          return self:_releaseFailed(id, why)
+        end
         if self.active then return self:_startClaim(id) end
-        if self.state:owner(id) ~= self.me then
-          return self.log.i("release of " .. id .. " landed but " .. tostring(self.state:owner(id)) .. " owns it now")
+        local owner = self.state:owner(id)
+        if owner == t.target then return end -- the controller's broadcast got here before its reply
+        if owner ~= self.me then
+          return self.log.i("release of " .. id .. " landed but " .. tostring(owner) .. " owns it now")
         end
         self:_writeOwner(id, t.target)
         self:_broadcast()
@@ -544,7 +622,10 @@ function Node:_sendHello(name)
   if not self.running then return end
   self.transport:send(name, "hello", self:_stateBody(), function(ok, reply, status)
     if not ok then return self.log.d("hello to " .. tostring(name) .. " failed: " .. tostring(status)) end
-    if type(reply) == "table" then self.state:merge(reply.state) end
+    if type(reply) == "table" then
+      self.state:merge(reply.state)
+      self:_syncAway()
+    end
     if self.lastSeenFrom then self:_ownerReturned(self.lastSeenFrom) end
   end)
 end
@@ -582,10 +663,12 @@ function Node:onMessage(msg)
   local body = type(msg.body) == "table" and msg.body or {}
   if msg.type == "hello" then
     self.state:merge(body.state)
+    self:_syncAway()
     self:_ownerReturned(from)
     return 200, self:_stateBody()
   elseif msg.type == "state" then
     self.state:merge(body.state)
+    self:_syncAway()
     return 204, nil
   elseif msg.type == "request" then
     return 200, self:_handleRequest(body)
@@ -625,6 +708,7 @@ function Node:start()
   self.heartbeat = self.timer.doEvery(self.cfg.heartbeat, function() self:_heartbeat() end)
 
   if active then self:_onActive("start") end
+  self:_syncAway()
   return true
 end
 
@@ -633,6 +717,13 @@ function Node:stop()
   self.running = false
   if self.heartbeat then self.heartbeat:stop() self.heartbeat = nil end
   self:_cancelIntents()
+  -- Leave nothing mirrored behind: the display must be back for whoever runs next (or for the user).
+  if self.away ~= nil then
+    local ids = {}
+    for id in pairs(self.mirrored) do ids[#ids + 1] = id end
+    table.sort(ids)
+    for _, id in ipairs(ids) do self:_stopMirror(id) end
+  end
   for _, display in pairs(self.displays) do display:cancel() end
   self.releasing = {}
   self.activity:stop()
@@ -684,10 +775,18 @@ function Node:status()
 
   local displays = {}
   for id, display in pairs(self.displays) do
+    -- Same fallback as _canSwitch: without `control` every node with an input may switch.
     local control = {}
-    for i, name in ipairs(self.cfg.displays[id].control or {}) do control[i] = name end
+    local list = self.cfg.displays[id].control
+    if list == nil then
+      list = {}
+      for name in pairs(self.cfg.displays[id].inputs) do list[#list + 1] = name end
+      table.sort(list)
+    end
+    for i, name in ipairs(list) do control[i] = name end
     displays[id] = {
       owner = self.state:owner(id), visible = display:visible(), input = display:inputFor(self.me), control = control,
+      mirrored = self.mirrored[id] ~= nil,
     }
   end
   return { node = self.me, instance = self.instance, peers = peers, displays = displays }
