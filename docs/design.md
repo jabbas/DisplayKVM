@@ -276,7 +276,7 @@ spoon.DisplayKVM:bindHotkeys({ claim = { { "ctrl", "alt", "cmd" }, "M" } })  -- 
 
 **Validation.** `configure()` checks the schema: the node appears in some `inputs`, `home` has an input, `control` is a non-empty list of nodes that have an input, `whenAway` and `mirrorTo` only name such nodes (and `whenAway` only `"mirror"`), the secret is long enough, and the binary of a built-in backend exists. On error it logs, shows a macOS notification, and `start()` does nothing.
 
-**`status()`** returns `{ node, instance, peers, displays }`. `peers[name]` is `{ lastSeen, active, alive }`: the time of the last verified message, the peer's replicated presence (`false` when inactive, `nil` when unknown) and whether it was heard from within 3 heartbeat intervals. `displays[id]` is `{ owner, visible, input }`: the recorded owner, whether this Mac currently sees the monitor, and this node's DDC input.
+**`status()`** returns `{ node, instance, peers, displays }`. `peers[name]` is `{ lastSeen, active, alive }`: the time of the last verified message, the peer's replicated presence (`false` when inactive, `nil` when unknown) and whether it was heard from within 3 heartbeat intervals. `displays[id]` is `{ owner, visible, input, control, mirrored }`: the recorded owner, whether this Mac currently sees the monitor (false on a node that is currently mirroring the display), this node's DDC input, the nodes that can switch the display over DDC, and whether this node currently mirrors it.
 
 **Caveat for publishers.** The default `node` is the machine's hostname. Anyone publishing their configuration should set `node` explicitly.
 
@@ -312,6 +312,7 @@ General rule: state is always repairable by the next event. Everything is logged
 - Always-visible displays cannot be verified after a switch.
 - A port without DDC cannot be diagnosed from that Mac: the HDMI port of a Mac mini M1 has no working DDC, and `m1ddc` reports success (status 0) anyway. Check by observing `set input`, not `get`, and keep such a node out of `control`. DDC reads (`get input`) from a Mac are stale after a switch and are not used.
 - A controller that hangs with the cable plugged in leaves the monitor asleep; there is no automatic switch.
+- A controller that was off the network for more than about 90 s while it held the display makes the home node take the display over in the state (R3b), although the monitor still shows the controller. The controller's next lock then does nothing (the state names the home node as the owner); the claim hotkey on the controller, or a lock and unlock, resyncs.
 - `whenAway` relies on macOS-wide display mirroring, which briefly reconfigures all the displays (layout flicker, windows rearranged).
 - Mirror recovery after a crash is a heuristic (see the table above).
 - `hs.window` has no `ensureIsInScreenBounds`; the windows are pulled back with `setFrameInScreenBounds()` without a rectangle, which re-applies the current frame fitted to the screen.

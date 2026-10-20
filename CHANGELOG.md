@@ -14,7 +14,8 @@ All notable changes to this project are documented in this file. The format foll
 - `displays.<id>.whenAway` (`{ node = "mirror" }`) and `mirrorTo`: a node hides a display that another node owns by
   mirroring it onto another screen (its primary screen by default), pulls windows left half off the edge back into
   the screen, and stops the mirror when it owns the display again, at `stop()`, and after a reload (the mirror
-  left by a previous run is recovered from the state, with a 5 second grace period while the owner is unknown).
+  left by a previous run is inferred at start from the display missing among the screens, a heuristic, with a 5 second
+  grace period while the owner is unknown).
   For monitors that stay listed on every Mac whatever input is selected.
 - State recovery without DDC. A node in `control` that owned a display and no longer sees it records
   `owner = home` (checked 2 seconds after a screen change and on every heartbeat), and the home node takes

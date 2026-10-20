@@ -383,8 +383,10 @@ end
 ---    (`lastSeen`: epoch milliseconds of the last verified message from the peer, nil if never; `active`:
 ---    the peer's replicated presence, false when it is inactive, nil when nothing is known about it; `alive`:
 ---    heard from within 3 heartbeat intervals) and `displays[id]` is
----    `{ owner = node|nil, visible = boolean, input = number|nil }` (`owner`: recorded owner, nil when
----    unknown; `visible`: this Mac currently sees the monitor; `input`: this node's DDC input)
+---    `{ owner = node|nil, visible = boolean, input = number|nil, control = {node...}, mirrored = boolean }`
+---    (`owner`: recorded owner, nil when unknown; `visible`: this Mac currently sees the monitor, false while
+---    this node mirrors the display; `input`: this node's DDC input; `control`: the nodes that can switch the
+---    display over DDC; `mirrored`: this node currently mirrors the display)
 function obj:status()
   if self._node == nil then return nil end
   return self._node:status()

@@ -190,7 +190,7 @@ for the nodes that should lose the screen: while another node owns the display, 
 screen (`hs.screen:mirrorOf`), which removes it from the layout, and pulls windows left half off the edge back inside
 the screen. When the node owns the display again, it stops the mirror (`mirrorStop` on the target) and the windows
 return by themselves. The mirror is also applied at start and on reload, based on the state learned from the peers,
-and it is always removed by `stop()`. Mirroring is decided from the replicated state only, never by detecting the
+and it is removed by `stop()`. Mirroring is decided from the replicated state only, never by detecting the
 physical input.
 
 Example: the `desk-mini` Mac's HDMI port has no DDC, the laptop reaches the monitor over USB-C (with DDC), and the
@@ -214,7 +214,9 @@ input auto-switch moves the picture, see below):
   it (for example the cable was unplugged), records `owner = home` and tells the others, without sending DDC. This only
   applies when the home node cannot switch the display itself, and it is checked 2 seconds after a screen
   configuration change and on every heartbeat. It does not fire while this node mirrors the display itself, while a
-  release or a claim of it is in progress, or just after the mirror was stopped.
+  release or a claim of it is in progress, or just after the mirror was stopped. Plugging the cable back in does not
+  make the controller claim the display again: that is by design (it would steal the display back from the node that
+  has it now). Lock and unlock the controller, or press the claim hotkey.
 - **Every controller is gone.** On the home node, when the recorded owner is not alive and no node in `control` is
   alive (they have been silent for 3 heartbeat intervals, so about 90 to 120 seconds), the home node takes the
   ownership in the state, again without DDC. This is what removes the mirror after a controller crashed or went off
@@ -247,6 +249,10 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
   automatic switch (the monitor's Auto-Switch Input reacts to a lost signal, not to the screen going to sleep).
   After a minute or two the home node corrects the state and removes its mirror, but the picture only comes back
   when you switch the input with the monitor's buttons or unplug the cable.
+- A controller that was off the network for more than about 90 seconds while it held the display makes the home node
+  take the display over in the state (the "every controller is gone" repair), although the monitor still shows the
+  controller. The controller's next lock then does nothing: press the claim hotkey on the controller (or lock and
+  unlock it) to resync.
 - `whenAway` uses macOS-wide display mirroring, which briefly reconfigures the displays (the layout flickers and
   windows are rearranged).
 - A port without DDC cannot be diagnosed from that Mac: the HDMI port of a Mac mini M1 has no working DDC and
@@ -269,8 +275,10 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
     message from that Mac, or `nil` if there was none yet; `active` is that Mac's replicated presence (`false` when
     it is inactive, `nil` when nothing is known about it); `alive` is true if it was heard from within the last
     3 heartbeat intervals.
-  - `displays[id] = { owner, visible, input }`: `owner` is the Mac the state says has the display (`nil` if unknown);
-    `visible` is whether *this* Mac currently sees the monitor; `input` is this Mac's DDC input for it.
+  - `displays[id] = { owner, visible, input, control, mirrored }`: `owner` is the Mac the state says has the display
+    (`nil` if unknown); `visible` is whether *this* Mac currently sees the monitor (it is false on a Mac that is
+    currently mirroring the display); `input` is this Mac's DDC input for it; `control` lists the nodes that can
+    switch it over DDC; `mirrored` is whether this Mac currently mirrors it.
 - **Logs:** the logger is named `DisplayKVM`. Raise detail with `logLevel = "debug"` in `configure`.
 - **The monitor flips back by itself:** disable the monitor's automatic input selection in its OSD menu. The exception
   is a setup that uses `control` / `whenAway` for a port without DDC: keep it enabled there (see
