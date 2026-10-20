@@ -522,10 +522,29 @@ function Node:_attempt(intent)
   self:_broadcastRequest(intent, nil)
 end
 
+-- A node outside `control` whose claim reached no controller (none alive, or none answered). When the
+-- state already names this node as the owner, or names nobody and this node is the display's home, the
+-- monitor is most likely on this node's input (it fell back to home on its own, F7): record that, drop the
+-- intent and stay quiet. When the state names ANOTHER owner there is a real failure, so it returns false.
+function Node:_assumeHere(intent)
+  local id = intent.id
+  if self:_canSwitch(id, self.me) then return false end
+  local owner = self.state:owner(id)
+  if not (owner == self.me or (owner == nil and self.cfg.displays[id].home == self.me)) then return false end
+  self.log.i("no controller reachable for " .. id .. "; assuming it shows this node")
+  if owner ~= self.me then
+    self:_writeOwner(id, self.me)
+    self:_broadcast()
+  end
+  self:_cancelIntent(id)
+  return true
+end
+
 function Node:_broadcastRequest(intent, skip)
   local targets = self:_requestTargets(intent.id, skip)
   if #targets == 0 then
     self.log.d("no alive peer to ask for " .. intent.id)
+    if self:_assumeHere(intent) then return end
     return self:_retry(intent)
   end
   self:_ask(intent, targets, function(ok)
@@ -601,6 +620,7 @@ function Node:_retry(intent)
 end
 
 function Node:_exhausted(intent)
+  if self:_assumeHere(intent) then return end
   intent.exhausted = true
   self.log.e("cannot claim " .. intent.id)
   self:_notify("claim-failed", "cannot claim " .. intent.id)
