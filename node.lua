@@ -84,6 +84,7 @@ function Node.new(cfg, deps)
   self.mirrored = {}      -- display id -> uuid of the screen it is mirrored onto (whenAway)
   self.mirrorWarned = {}  -- display id -> owner for which a failed mirror was already warned about
   self.stopWarned = {}    -- display id -> true after a failed unmirror was warned about (reset on success)
+  self.unmirroredAt = {}  -- display id -> ms when this node last stopped mirroring it (see _checkHeld)
   self.suspected = {}     -- display id -> true while `mirrored` is only a guess made at start
   self.active = false
   self.lidClosed = false
@@ -204,6 +205,7 @@ function Node:_stopMirror(id)
   self.stopWarned[id] = nil
   self.mirrored[id] = nil
   self.suspected[id] = nil
+  self.unmirroredAt[id] = self.now()
   self.log.i(id .. " is back, mirror stopped")
 end
 
@@ -271,19 +273,32 @@ local SCREEN_DEBOUNCE = 2
 -- R3a. A controller that owns a display and no longer sees it has lost it: with the monitor's input
 -- auto-switch (F7) it fell back to the home node, which has no DDC to be told. Record that in the state.
 -- Not for a display this node mirrors itself (it is hidden by our own doing), nor while a release of the
--- display is in flight (it will write the owner by itself, and the target may not be home).
-function Node:_checkHeld()
+-- display is in flight (it will write the owner by itself, and the target may not be home), nor while a
+-- claim of the display is live (its verification would see the owner change under it), nor within one
+-- debounce period after this node stopped mirroring it (the screen may take a moment to be listed again; the
+-- check is then repeated by itself). It applies only when the home node cannot switch the display by DDC
+-- itself, which is the premise of the monitor's auto-switch (F7): in a 0.1.x configuration it never fires.
+-- `quiet`: the caller (the heartbeat) sends the state itself, so no broadcast here.
+function Node:_checkHeld(quiet)
   if not self.running then return end
   local ids = {}
   for id in pairs(self.displays) do ids[#ids + 1] = id end
   table.sort(ids)
   for _, id in ipairs(ids) do
     local home = self.cfg.displays[id].home
+    local intent = self.intents[id]
     if self.state:owner(id) == self.me and home ~= nil and home ~= self.me and self:_canSwitch(id, self.me)
+        and not self:_canSwitch(id, home) and (intent == nil or intent.exhausted)
         and self.mirrored[id] == nil and not self.releasing[id] and not self.displays[id]:visible() then
-      self.log.i(id .. " disappeared, assuming it switched to " .. home)
-      self:_writeOwner(id, home)
-      self:_broadcast()
+      local stoppedAt = self.unmirroredAt[id]
+      if stoppedAt ~= nil and self.now() - stoppedAt < SCREEN_DEBOUNCE * 1000 then
+        self.log.d("not checking " .. id .. " yet, the mirror was stopped just now")
+        self:_onScreensChanged()
+      else
+        self.log.i(id .. " disappeared, assuming it switched to " .. home)
+        self:_writeOwner(id, home)
+        if not quiet then self:_broadcast() end
+      end
     end
   end
 end
@@ -291,7 +306,7 @@ end
 -- R3b. The home node cannot run DDC. When the display's owner is gone and so is every node that could
 -- switch it, the monitor has fallen back to the home input on its own: take the ownership in the state.
 -- Needs no activity of this node and sends no DDC.
-function Node:_recoverHome()
+function Node:_recoverHome(quiet)
   if not self.running then return end
   local ids = {}
   for id in pairs(self.displays) do ids[#ids + 1] = id end
@@ -303,7 +318,7 @@ function Node:_recoverHome()
       self.log.i(string.format("%s: owner %s and every node with control are gone, taking ownership in the state",
         id, owner))
       self:_writeOwner(id, self.me)
-      self:_broadcast()
+      if not quiet then self:_broadcast() end
     end
   end
 end
@@ -326,8 +341,9 @@ function Node:_onScreensChanged()
 end
 
 function Node:_heartbeat()
-  self:_checkHeld()
-  self:_recoverHome()
+  -- Any write of the checks goes out with the heartbeat state below.
+  self:_checkHeld(true)
+  self:_recoverHome(true)
   local body = self:_stateBody()
   local hello = {}
   for _, address in ipairs(self.discovery:unaliased(function(name) return self:alive(name) end)) do

@@ -1567,7 +1567,10 @@ describe("state recovery without DDC", function()
       nodes = { "desk-mini", "laptop" },
       home = "desk-mini",
       whenAway = { laptop = "mirror" },
-      monitor = { inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
     })
     sim:start()
     sim:advance(1)
@@ -1585,6 +1588,99 @@ describe("state recovery without DDC", function()
     sim:node("laptop").mirrored.left = nil
     sim:node("laptop"):_checkHeld()
     assert.equal("desk-mini", sim:owner("laptop"))
+  end)
+
+  it("R3a leaves a display alone while a claim intent is live, and acts once it is exhausted or gone", function()
+    local sim = laptopOwns()
+    local laptop = sim:node("laptop")
+    sim:unplug("laptop", { silent = true })
+    laptop.intents.left = { id = "left", attempts = 1 } -- a claim waiting for its verification
+    laptop:_checkHeld()
+    assert.equal("laptop", sim:owner("laptop"))
+    laptop.intents.left.exhausted = true
+    laptop:_checkHeld()
+    assert.equal("desk-mini", sim:owner("laptop"))
+  end)
+
+  it("R3a is off when home can switch the display itself (0.1.x configs): claim verification keeps retrying", function()
+    -- S7b setup (no `control`: every node switches itself), a monitor that never shows the claim, and a
+    -- screen change at unlock: R3a must not write the home as owner behind the claim's back.
+    local sim = make()
+    sim.monitor.stuck = true
+    sim:activate("laptop")
+    sim:entry("laptop").screenWatcher.fire()
+    sim:advance(60)
+    assert.equal(5, requests(sim, "laptop"))
+    assert.equal(1, sim:notified("claim-failed", "laptop"))
+    assert.same({}, logged(sim, "laptop", "i", "disappeared"))
+    assert.same({}, logged(sim, "laptop", "i", "lost to"))
+  end)
+
+  it("R3a is off for a heartbeat in a 0.1.x config too", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:unplug("laptop", { silent = true })
+    sim:advance(100)
+    assert.equal("laptop", sim:owner("laptop"))
+    assert.same({}, logged(sim, "laptop", "i", "disappeared"))
+  end)
+
+  it("R3a waits one debounce period after this node stopped mirroring the display", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = { laptop = "mirror" },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(1)
+    assert.is_true(sim:mirrored("laptop"))
+    -- the laptop takes the display: its mirror stops, but the screen may take a moment to be listed again
+    sim:node("laptop"):_writeOwner("left", "laptop")
+    assert.is_false(sim:mirrored("laptop"))
+    sim:unplug("laptop", { silent = true }) -- the display is still not listed
+    sim:node("laptop"):_checkHeld()
+    assert.equal("laptop", sim:owner("laptop"))
+    sim:advance(1.9)
+    assert.equal("laptop", sim:owner("laptop"))
+    sim:advance(0.2) -- the suppressed check was rescheduled by itself
+    assert.equal("desk-mini", sim:owner("laptop"))
+  end)
+
+  it("a heartbeat that writes through R3a carries the result: one state per peer, no extra broadcast", function()
+    local sim = laptopOwns()
+    sim:unplug("laptop", { silent = true })
+    sim:advance(27) -- laptopOwns() ends at t = 2 s
+    local before = #sim:sent({ from = "laptop", type = "state" })
+    sim:advance(2) -- the heartbeat at t = 30
+    assert.equal("desk-mini", sim:owner("laptop"))
+    assert.equal(before + 1, #sim:sent({ from = "laptop", type = "state" }))
+  end)
+
+  it("a heartbeat that writes through R3b carries the result: one state per peer, no extra broadcast", function()
+    local sim = laptopOwns()
+    sim:partition("laptop", true)
+    sim:advance(117) -- t = 119 s
+    assert.equal("laptop", sim:owner("desk-mini"))
+    local before = #sim:sent({ from = "desk-mini", type = "state" })
+    sim:advance(2) -- the heartbeat at t = 120
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.equal(before + 1, #sim:sent({ from = "desk-mini", type = "state" }))
+  end)
+
+  it("a screen-change check that writes still broadcasts at once", function()
+    local sim = laptopOwns()
+    local before = #sim:sent({ from = "laptop", type = "state" })
+    sim:unplug("laptop")
+    sim:advance(2.5)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.equal(before + 1, #sim:sent({ from = "laptop", type = "state" }))
   end)
 
   it("R3a leaves a display alone while its release is in flight", function()
@@ -1633,6 +1729,24 @@ describe("state recovery without DDC", function()
   it("R3b does nothing while the owner is alive or another controller is", function()
     local sim = laptopOwns()
     sim:advance(300)
+    assert.equal("laptop", sim:owner("desk-mini"))
+    assert.same({}, logged(sim, "desk-mini", "i", "taking ownership"))
+  end)
+
+  it("R3b does not take over while another node with control is alive", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop", "studio" }, home = "desk-mini",
+      monitor = {
+        inputs = ALL_INPUTS, mode = "sticky", acceptsInactive = true, input = 15,
+        control = { "laptop", "studio" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:partition("laptop", true)
+    sim:advance(300) -- the owner is long gone, studio still answers every heartbeat
     assert.equal("laptop", sim:owner("desk-mini"))
     assert.same({}, logged(sim, "desk-mini", "i", "taking ownership"))
   end)
