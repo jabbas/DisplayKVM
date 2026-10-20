@@ -4,7 +4,8 @@
 --   Node.new(cfg, deps)
 --
 -- cfg: the validated Config table. Used fields: node (this node's name), heartbeat (seconds),
---   displays[id].inputs (read by Policy), activity.lid (boolean), plus whatever Policy reads from it.
+--   displays[id].inputs (read by Policy), displays[id].control (nodes that may run DDC for the display;
+--   a node outside it switches through a peer inside it), activity.lid (boolean), plus whatever Policy reads from it.
 --
 -- deps (all required unless marked optional):
 --   state      State object (:setOwner :setPresence :owner :presence :merge :snapshot)
@@ -43,6 +44,7 @@ local WIRE_REASONS = {
   ["not-visible"] = "not-visible",
   ["backend-error"] = "backend-error",
   ["unknown-node"] = "unknown-display",
+  ["not-capable"] = "not-capable",
 }
 
 local noop = function() end
@@ -201,17 +203,62 @@ function Node:_startClaim(id)
   self:_attempt(intent)
 end
 
--- Alive peers that take part in the display, minus `skip`, sorted by name.
+-- Whether `node` may run the DDC backend for display `id`: it is listed in the display's `control`
+-- (Config defaults that to every node with an input). A node outside `control` never calls the backend
+-- for the display; it asks a node inside `control` instead (see _delegate).
+function Node:_canSwitch(id, node)
+  local control = self.cfg.displays[id].control
+  if control == nil then return self.displays[id]:inputFor(node) ~= nil end
+  for _, name in ipairs(control) do
+    if name == node then return true end
+  end
+  return false
+end
+
+-- Alive peers that can switch the display, minus `skip`, sorted by name.
 function Node:_requestTargets(id, skip)
-  local display = self.displays[id]
   local out = {}
   for name in pairs(self.lastSeen) do
-    if name ~= self.me and name ~= skip and self:alive(name) and display:inputFor(name) ~= nil then
+    if name ~= self.me and name ~= skip and self:alive(name) and self:_canSwitch(id, name) then
       out[#out + 1] = name
     end
   end
   table.sort(out)
   return out
+end
+
+-- Alive peers a node without DDC can hand a switch to: the recorded owner first (when it can switch),
+-- then the remaining ones sorted by name.
+function Node:_controlTargets(id)
+  local owner = self.state:owner(id)
+  local rest = self:_requestTargets(id, owner)
+  if owner ~= nil and owner ~= self.me and self:alive(owner) and self:_canSwitch(id, owner) then
+    table.insert(rest, 1, owner)
+  end
+  return rest
+end
+
+-- Switches display `id` to `target` through a capable peer: sends `request {display, to = target}` to the
+-- targets of _controlTargets one after the other; the first ok wins. cb(true), or cb(false, reason) when
+-- there is no target or all of them refused or did not answer.
+function Node:_delegate(id, target, cb)
+  local targets = self:_controlTargets(id)
+  local function try(i)
+    if not self.running then return end
+    local peer = targets[i]
+    if peer == nil then
+      self.log.d("no alive node with control to switch " .. id .. " to " .. tostring(target))
+      return cb(false, "no-controller")
+    end
+    self.transport:send(peer, "request", { display = id, to = target }, function(ok, reply, status)
+      if not self.running then return end
+      if ok and type(reply) == "table" and reply.result == "ok" then return cb(true) end
+      local why = type(reply) == "table" and reply.reason or status
+      self.log.d("delegated switch of " .. id .. " via " .. tostring(peer) .. " failed: " .. tostring(why))
+      try(i + 1)
+    end)
+  end
+  try(1)
 end
 
 -- Sends `request` to every target at once; cb(true) on the first ok, cb(false) when all failed.
@@ -251,7 +298,7 @@ function Node:_attempt(intent)
 
   local id = intent.id
   local display = self.displays[id]
-  if display:visible() and display.pull ~= false then
+  if display:visible() and display.pull ~= false and self:_canSwitch(id, self.me) then
     display:switchTo(self.me, function(ok, reason)
       if not self:_live(intent) then
         if ok then self:_lateClaim(intent) end
@@ -265,7 +312,7 @@ function Node:_attempt(intent)
   end
 
   local owner = self.state:owner(id)
-  if owner ~= nil and owner ~= self.me and self:alive(owner) and display:inputFor(owner) ~= nil then
+  if owner ~= nil and owner ~= self.me and self:alive(owner) and self:_canSwitch(id, owner) then
     self:_ask(intent, { owner }, function(ok)
       if ok then return self:_claimed(intent, true) end
       self:_fallback(intent, owner)
@@ -392,17 +439,27 @@ function Node:_onInactive(reason, sync)
   local alive = function(name) return self:alive(name) end
   local targets = self.policy.onInactive(self.state, self.cfg, self.me, alive)
   if sync then
+    local delegated = {}
     for _, t in ipairs(targets) do
-      -- Runs even when an async release of the same display is in flight: the switch to the same target
-      -- is idempotent and the async one may be suspended by the sleep.
-      local ok, why = self.displays[t.display]:switchToSync(t.target, SLEEP_SWITCH_TIMEOUT)
-      if ok then
-        self:_writeOwner(t.display, t.target)
+      if self:_canSwitch(t.display, self.me) then
+        -- Runs even when an async release of the same display is in flight: the switch to the same target
+        -- is idempotent and the async one may be suspended by the sleep.
+        local ok, why = self.displays[t.display]:switchToSync(t.target, SLEEP_SWITCH_TIMEOUT)
+        if ok then
+          self:_writeOwner(t.display, t.target)
+        else
+          self:_releaseFailed(t.display, why)
+        end
       else
-        self:_releaseFailed(t.display, why)
+        delegated[#delegated + 1] = t
       end
     end
     self:_broadcastSync()
+    -- A node without DDC hands its release to a capable peer. On the sleep path this is best effort and
+    -- asynchronous (there is no blocking request/reply primitive that returns the peer's verdict): such a
+    -- node is in practice a desktop that does not sleep while its owner is away. If the machine does
+    -- suspend before the answer, the peer's own recovery (R3) and the next claim put the state right.
+    self:_releaseAsync(delegated)
     return
   end
 
@@ -420,6 +477,13 @@ function Node:_releaseFailed(id, why)
   self.log.e("release of " .. id .. " failed: " .. tostring(why))
 end
 
+-- Asynchronous release switch: through the own backend when this node may switch the display, otherwise
+-- delegated to a capable peer. done(ok, reason).
+function Node:_switchAway(id, target, done)
+  if self:_canSwitch(id, self.me) then return self.displays[id]:switchTo(target, done) end
+  self:_delegate(id, target, done)
+end
+
 -- Async release of {display, target} pairs. At most one per display is in flight; a second inactivity
 -- event meanwhile (lock, then sleep or lid close) adds nothing. When the switch lands the situation
 -- may have changed: the node may be active again (claim afresh, the monitor now shows the target) or a
@@ -431,7 +495,7 @@ function Node:_releaseAsync(targets)
       self.log.d("release of " .. id .. " already in flight")
     else
       self.releasing[id] = true
-      self.displays[id]:switchTo(t.target, function(ok, why)
+      self:_switchAway(id, t.target, function(ok, why)
         self.releasing[id] = nil
         if not self.running then return end
         if not ok then return self:_releaseFailed(id, why) end
@@ -489,6 +553,12 @@ function Node:_handleRequest(body)
   local display = type(body.display) == "string" and self.displays[body.display] or nil
   if display == nil or type(body.to) ~= "string" then
     return { result = "failed", reason = "unknown-display" }
+  end
+  -- A node outside `control` never runs the backend, not even for a request from a 0.1.x peer that
+  -- does not know about `control` and addressed this node as the current owner.
+  if not self:_canSwitch(display.id, self.me) then
+    self.log.d("refusing request for " .. display.id .. ": not in control")
+    return { result = "failed", reason = "not-capable" }
   end
   local ok, reason = display:switchToSync(body.to, REQUEST_SWITCH_TIMEOUT)
   if ok then
@@ -614,7 +684,11 @@ function Node:status()
 
   local displays = {}
   for id, display in pairs(self.displays) do
-    displays[id] = { owner = self.state:owner(id), visible = display:visible(), input = display:inputFor(self.me) }
+    local control = {}
+    for i, name in ipairs(self.cfg.displays[id].control or {}) do control[i] = name end
+    displays[id] = {
+      owner = self.state:owner(id), visible = display:visible(), input = display:inputFor(self.me), control = control,
+    }
   end
   return { node = self.me, instance = self.instance, peers = peers, displays = displays }
 end

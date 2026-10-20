@@ -8,7 +8,10 @@
 -- Options (Sim.new):
 --   nodes        list of node names (all are built, none started until sim:start)
 --   monitor      {inputs = node -> DDC input, mode = "detaching"|"sticky", acceptsInactive = bool,
---                 input = start input (default: the home node's input)}
+--                 input = start input (default: the home node's input),
+--                 control = list of nodes allowed to run DDC (default: every node in inputs, sorted),
+--                 noDdc = list of nodes whose backend reports success but never changes the monitor
+--                 (fact F1: Mac mini HDMI); their backend calls are counted by sim:ddcCalls(name)}
 --   home, pull   display settings (pull defaults to true), displayId (default "left")
 --   heartbeat    seconds (default 30)         latency  network one-way delay in seconds (default 0.01)
 --   partitionMode "unreachable" (default): a send involving a partitioned node fails at once with
@@ -33,7 +36,8 @@
 -- Observation: sim:input(), sim:owner(viewer), sim:presence(viewer, name), sim:node(name), sim:state(name),
 --   sim.monitor (commands, applied, stuck, failing), sim.counts[name] = {switchTo, switchToSync, sendSync,
 --   broadcastSync, cancel}, sim.messages (every send), sim:sent{from=,to=,type=}, sim.notifications,
---   sim:notified(kind, node).
+--   sim:notified(kind, node), sim:ddcCalls(name) (switchTo/switchToSync calls that reached the backend of a
+--   noDdc node).
 
 local fakes = dofile("spec/support/fakes.lua")
 local State = dofile("state.lua")
@@ -99,6 +103,10 @@ local function newDisplay(sim, node, id, spec)
   function d:switchTo(target, done)
     counts.switchTo = counts.switchTo + 1
     if spec.inputs[target] == nil then return done(false, "unknown-node") end
+    if sim.noDdc[node] then
+      sim.ddcCount[node] = sim.ddcCount[node] + 1
+      return sim.timer.doAfter(sim.ddcLatency, function() done(true) end)
+    end
     if not self:visible() then return done(false, "not-visible") end
     local ok
     local early = sim.ddcApply == "start"
@@ -114,6 +122,10 @@ local function newDisplay(sim, node, id, spec)
   function d:switchToSync(target, _)
     counts.switchToSync = counts.switchToSync + 1
     if spec.inputs[target] == nil then return false, "unknown-node" end
+    if sim.noDdc[node] then
+      sim.ddcCount[node] = sim.ddcCount[node] + 1
+      return true
+    end
     if not self:visible() then return false, "not-visible" end
     if sim.monitor:command(node, target) then return true end
     return false, "backend-error"
@@ -272,6 +284,7 @@ function Sim:_build(name)
 
   local displaySpec = {
     inputs = self.monitor.inputs, home = self.home, pull = self.pull, match = self.displayId,
+    control = self.control,
   }
   local cfg = {
     node = name,
@@ -354,6 +367,15 @@ function Sim.new(opts)
   for node, address in pairs(self.static) do self.addressOwner[address] = node end
   self.ddcLatency = DDC_LATENCY
   self.ddcApply = "end"
+  self.control = opts.monitor.control
+  if self.control == nil then
+    self.control = {}
+    for node in pairs(opts.monitor.inputs) do self.control[#self.control + 1] = node end
+    table.sort(self.control)
+  end
+  self.noDdc, self.ddcCount = {}, {}
+  for _, node in ipairs(opts.monitor.noDdc or {}) do self.noDdc[node] = true end
+  for _, node in ipairs(opts.nodes) do self.ddcCount[node] = 0 end
   self.lidEnabled = opts.lid == true
   self.monitor = newMonitor({
     inputs = opts.monitor.inputs,
@@ -451,6 +473,8 @@ function Sim:sent(filter)
   end
   return out
 end
+
+function Sim:ddcCalls(name) return self.ddcCount[name] or 0 end
 
 function Sim:notified(kind, node)
   local n = 0

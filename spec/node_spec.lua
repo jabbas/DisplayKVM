@@ -16,7 +16,10 @@ local function make(o)
     lid = o.lid,
     static = o.static,
     partitionMode = o.partitionMode,
-    monitor = { inputs = inputs, mode = o.mode, acceptsInactive = o.acceptsInactive, input = o.input },
+    monitor = {
+      inputs = inputs, mode = o.mode, acceptsInactive = o.acceptsInactive, input = o.input,
+      control = o.control, noDdc = o.noDdc,
+    },
   })
   if not o.delayed then
     sim:start()
@@ -845,5 +848,218 @@ describe("Node manual control and lifecycle", function()
     sim:node("laptop"):stop()
     sim:advance(1)
     assert.equal(0, sim.timer.pending())
+  end)
+end)
+
+-- The desk-mini has no working DDC (fact F1): only the laptop is in `control`. The monitor is sticky
+-- (always visible to both) and, like the real one driven over USB-C, accepts commands whatever it shows.
+describe("control (nodes without DDC)", function()
+  local function makeControl()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    return sim
+  end
+
+  -- Both nodes are known to each other; the laptop is active and owns the monitor.
+  local function laptopOwns()
+    local sim = makeControl()
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    return sim
+  end
+
+  it("C1 laptop unlock: laptop pulls itself", function()
+    local sim = makeControl()
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "laptop")
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("C2 laptop lock: laptop pushes to desk-mini", function()
+    local sim = laptopOwns()
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("C3 desk-mini active while laptop owns: desk-mini asks laptop", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assert.is_true(#sim:sent({ from = "desk-mini", type = "request" }) > 0)
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("C4 desk-mini release while it owns and laptop is active: delegates to laptop", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    sim:lock("desk-mini")
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "laptop")
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+    local requests_ = sim:sent({ from = "desk-mini", type = "request" })
+    assert.equal("laptop", requests_[#requests_].to)
+    assert.same({ display = "left", to = "laptop" }, requests_[#requests_].body)
+  end)
+
+  it("C4b a delegated release reaches a target other than the controller", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop", "studio" }, home = "desk-mini",
+      monitor = {
+        inputs = ALL_INPUTS, mode = "sticky", acceptsInactive = true, input = 15,
+        control = { "laptop" }, noDdc = { "desk-mini", "studio" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:activate("studio") -- studio is now the latest active peer
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    sim:lock("studio")
+    sim:advance(1)
+    sim:lock("desk-mini")
+    sim:advance(1)
+    -- desk-mini holds no DDC and the best peer is laptop (still active)
+    assert.equal(16, sim:input())
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+    assert.equal(0, sim:ddcCalls("studio"))
+  end)
+
+  it("C5 desk-mini refuses a request (not-capable) and sends no DDC", function()
+    local sim = makeControl()
+    local status, reply = sim:node("desk-mini"):onMessage({
+      type = "request", from = "laptop", instance = "x", ts = 0, body = { display = "left", to = "laptop" },
+    })
+    assert.equal(200, status)
+    assert.same({ result = "failed", reason = "not-capable" }, reply)
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+    assert.equal(17, sim:input())
+  end)
+
+  it("C6 laptop offline: desk-mini claim exhausts and notifies once", function()
+    local sim = laptopOwns()
+    sim:partition("laptop", true)
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(1, sim:notified("claim-failed", "desk-mini"))
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+    assert.equal(21, sim:input())
+  end)
+
+  it("C7 claim() on desk-mini while the laptop owns behaves like C3", function()
+    local sim = laptopOwns()
+    assert.is_true(sim:node("desk-mini"):claim())
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assert.is_true(#sim:sent({ from = "desk-mini", type = "request" }) > 0)
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("a node inside control never sends a request for itself, even when desk-mini owns the record", function()
+    local sim = makeControl()
+    sim:activate("desk-mini") -- owner unknown: asks the laptop
+    sim:advance(1)
+    assert.equal("desk-mini", sim:owner("laptop"))
+    sim:activate("laptop") -- pulls itself instead of asking desk-mini, which could not switch anyway
+    sim:advance(1)
+    assert.equal(0, #sim:sent({ from = "laptop", type = "request" }))
+    assert.equal(21, sim:input())
+  end)
+
+  it("a delegated release is in flight once per display", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    local before = #sim:sent({ from = "desk-mini", type = "request" })
+    sim:lock("desk-mini")
+    sim:lock("desk-mini") -- second inactivity event before the first request has been answered
+    assert.equal(before + 1, #sim:sent({ from = "desk-mini", type = "request" }))
+    sim:advance(1)
+    assert.same({}, sim:node("desk-mini").releasing)
+    assert.equal(21, sim:input())
+  end)
+
+  it("a delegated release that the controller refuses leaves the owner alone and logs an error", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim.monitor.failing = true
+    sim:lock("desk-mini")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.same({}, sim:node("desk-mini").releasing)
+  end)
+
+  it("a delegated release landing after desk-mini became active again claims afresh", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:lock("desk-mini")
+    sim:activate("desk-mini") -- before the controller answered
+    sim:advance(2)
+    assert.equal(17, sim:input())
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("a delegated release landing after someone else took the display writes and broadcasts nothing", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:lock("desk-mini")
+    -- before the answer arrives the state says someone else owns it
+    sim:state("desk-mini"):setOwner("left", "laptop", sim.now() + 10)
+    local before = #sim:sent({ from = "desk-mini", type = "state" })
+    sim:advance(1)
+    assert.equal("laptop", sim:owner("desk-mini"))
+    assert.equal(before, #sim:sent({ from = "desk-mini", type = "state" }))
+  end)
+
+  it("sleep on desk-mini delegates its release (best effort, asynchronous)", function()
+    local sim = laptopOwns()
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:sleep("desk-mini")
+    assert.equal(0, sim.counts["desk-mini"].switchToSync)
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("status() reports the control list", function()
+    local sim = makeControl()
+    assert.same({ "laptop" }, sim:node("desk-mini"):status().displays.left.control)
+  end)
+
+  it("without control every node switches itself (0.1.x behaviour)", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.same({ "desk-mini", "laptop" }, sim:node("laptop"):status().displays.left.control)
+    assert.equal(0, sim:ddcCalls("desk-mini"))
   end)
 end)
