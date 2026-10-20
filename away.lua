@@ -16,7 +16,8 @@
 --   settle    seconds to wait after a mirror before pulling the windows back into bounds (default 2)
 -- Methods: mirror(sourceUuid, targetUuid|nil) -> ok, usedUuid; unmirror(targetUuid) -> ok;
 -- defaultTarget(excludeUuid|nil) -> uuid|nil.
--- A `screen` has :getUUID() :mirrorOf(other) -> bool :mirrorStop() -> bool; a `window` :setFrameInScreenBounds().
+-- A `screen` has :getUUID() :mirrorOf(other) -> bool :mirrorStop() -> bool :frame(); a `window` has
+-- :isStandard() :isVisible() :frame() :screen() :setFrameInScreenBounds().
 
 local Away = {}
 Away.__index = Away
@@ -67,13 +68,33 @@ function Away:_cancelSettle()
   end
 end
 
--- Windows that stayed half off the edge after the mirror are pulled back in.
+-- True when rect `inner` lies fully inside rect `outer` (both {x, y, w, h}).
+local function fitsInside(inner, outer)
+  return inner.x >= outer.x and inner.y >= outer.y
+    and inner.x + inner.w <= outer.x + outer.w and inner.y + inner.h <= outer.y + outer.h
+end
+
+-- Windows that stayed half off the edge after the mirror are pulled back in. Only standard, visible
+-- windows whose frame is not fully inside their screen are touched (menu bars, panels, minimized and
+-- hidden windows are left alone).
 function Away:_pullWindowsBack()
   self._settleTimer = nil
+  local warnedMissing = false
   for _, window in ipairs(self._windows()) do
-    -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() with no rect re-applies the
-    -- window's current frame, adjusted to lie fully inside its screen.
-    local ok, err = pcall(window.setFrameInScreenBounds, window)
+    local ok, err = pcall(function()
+      if not (window:isStandard() and window:isVisible()) then return end
+      if fitsInside(window:frame(), window:screen():frame()) then return end
+      -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() with no rect re-applies the
+      -- window's current frame, adjusted to lie fully inside its screen.
+      if type(window.setFrameInScreenBounds) ~= "function" then
+        if not warnedMissing then
+          warnedMissing = true
+          self._log.w("window:setFrameInScreenBounds is not available, windows are not pulled back after the mirror")
+        end
+        return
+      end
+      window:setFrameInScreenBounds()
+    end)
     if not ok then self._log.d("could not move a window back into bounds: " .. tostring(err)) end
   end
 end

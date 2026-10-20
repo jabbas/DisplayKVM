@@ -402,7 +402,14 @@ describe("init", function()
         hs.screen.find = function(uuid) found[#found + 1] = uuid return realFind(uuid) end
         local moved = 0
         hs.window.allWindows = function()
-          return { { setFrameInScreenBounds = function() moved = moved + 1 end } }
+          local screenFrame = { x = 0, y = 0, w = 1000, h = 800 }
+          return { {
+            isStandard = function() return true end,
+            isVisible = function() return true end,
+            frame = function() return { x = 900, y = 100, w = 300, h = 200 } end,
+            screen = function() return { frame = function() return screenFrame end } end,
+            setFrameInScreenBounds = function() moved = moved + 1 end,
+          } }
         end
         obj:configure(validConfig({
           displays = {

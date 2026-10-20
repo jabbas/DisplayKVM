@@ -18,13 +18,26 @@ describe("Away", function()
     return s
   end
 
-  local function window(fails)
+  local SCREEN_FRAME = { x = 0, y = 0, w = 1000, h = 800 }
+
+  -- By default a standard, visible window that sticks out of its screen. `o`: fails, standard = false,
+  -- visible = false, frame = {x,y,w,h}, noMethod = true.
+  local function window(o)
+    if o == true then o = { fails = true } end
+    o = o or {}
     local w = { ensured = 0 }
-    -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() without a rect re-applies the
-    -- current frame, clamped to the screen.
-    function w:setFrameInScreenBounds()
-      self.ensured = self.ensured + 1
-      if fails then error("window gone") end
+    local frame = o.frame or { x = 900, y = 100, w = 300, h = 200 }
+    w.isStandard = function() return o.standard ~= false end
+    w.isVisible = function() return o.visible ~= false end
+    w.frame = function() return frame end
+    w.screen = function() return { frame = function() return SCREEN_FRAME end } end
+    if not o.noMethod then
+      -- hs.window has no ensureIsInScreenBounds; setFrameInScreenBounds() without a rect re-applies the
+      -- current frame, clamped to the screen.
+      function w:setFrameInScreenBounds()
+        self.ensured = self.ensured + 1
+        if o.fails then error("window gone") end
+      end
     end
     return w
   end
@@ -133,6 +146,58 @@ describe("Away", function()
       timer.advance(0.2)
       assert.equal(1, bad.ensured)
       assert.equal(1, good.ensured)
+    end)
+
+    it("pulls back only standard, visible windows that are not fully inside their screen", function()
+      screens = { screen("SRC"), screen("PRIMARY") }
+      local away = build(2)
+      local sticking = window()
+      local inside = window({ frame = { x = 10, y = 10, w = 1000 - 20, h = 800 - 20 } })
+      local exact = window({ frame = { x = 0, y = 0, w = 1000, h = 800 } })
+      local panel = window({ standard = false })
+      local hidden = window({ visible = false })
+      windows = { sticking, inside, exact, panel, hidden }
+      assert.is_true(away:mirror("SRC", nil))
+      timer.advance(2.1)
+      assert.equal(1, sticking.ensured)
+      assert.equal(0, inside.ensured)
+      assert.equal(0, exact.ensured)
+      assert.equal(0, panel.ensured)
+      assert.equal(0, hidden.ensured)
+    end)
+
+    it("a window whose inspection raises does not stop the rest", function()
+      screens = { screen("SRC"), screen("PRIMARY") }
+      local away = build(2)
+      local broken, good = window(), window()
+      broken.frame = function() error("window gone") end
+      windows = { broken, good }
+      assert.is_true(away:mirror("SRC", nil))
+      timer.advance(2.1)
+      assert.equal(1, good.ensured)
+    end)
+
+    it("warns once per mirror, not per window, when setFrameInScreenBounds is missing", function()
+      screens = { screen("SRC"), screen("PRIMARY") }
+      local away = build(2)
+      windows = { window({ noMethod = true }), window({ noMethod = true }), window({ noMethod = true }) }
+      assert.is_true(away:mirror("SRC", nil))
+      timer.advance(2.1)
+      local warnings = {}
+      for _, line in ipairs(log.lines) do
+        if line:sub(1, 2) == "w " then warnings[#warnings + 1] = line end
+      end
+      assert.equal(1, #warnings)
+      assert.truthy(warnings[1]:find("setFrameInScreenBounds", 1, true))
+      -- the next mirror may warn again
+      away:unmirror("PRIMARY")
+      assert.is_true(away:mirror("SRC", nil))
+      timer.advance(2.1)
+      warnings = {}
+      for _, line in ipairs(log.lines) do
+        if line:sub(1, 2) == "w " then warnings[#warnings + 1] = line end
+      end
+      assert.equal(2, #warnings)
     end)
   end)
 
