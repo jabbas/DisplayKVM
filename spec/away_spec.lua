@@ -86,10 +86,22 @@ describe("Away", function()
     end)
 
     it("fails without an error when the source or the explicit target is gone", function()
-      screens = { screen("PRIMARY") }
+      local primary = screen("PRIMARY")
+      screens = { primary }
       local away = build(1)
       assert.is_false(away:mirror("SRC", nil))
       assert.is_false(away:mirror("PRIMARY", "NOPE"))
+      assert.same({}, primary.mirrorCalls)
+      assert.equal(0, timer.pending())
+    end)
+
+    it("fails when the resolved target has no uuid, without calling mirrorOf or scheduling anything", function()
+      local source, nameless = screen("SRC"), screen(nil)
+      screens = { source, nameless }
+      local away = build(2)
+      assert.is_false(away:mirror("SRC", nil))
+      assert.same({}, source.mirrorCalls)
+      assert.equal(0, timer.pending())
     end)
 
     it("fails when there is no other screen to mirror onto", function()
@@ -122,6 +134,21 @@ describe("Away", function()
     end)
   end)
 
+  describe("defaultTarget", function()
+    it("is the primary screen, or the first other screen when the primary is excluded", function()
+      screens = { screen("A"), screen("B") }
+      local away = build(2)
+      assert.equal("B", away:defaultTarget(nil))
+      assert.equal("A", away:defaultTarget("B"))
+    end)
+
+    it("is nil when there is no suitable screen", function()
+      screens = { screen("A") }
+      local away = build(1)
+      assert.is_nil(away:defaultTarget("A"))
+    end)
+  end)
+
   describe("unmirror", function()
     it("calls mirrorStop on the target screen", function()
       local source, target = screen("SRC"), screen("PRIMARY")
@@ -142,6 +169,18 @@ describe("Away", function()
       screens = { screen("PRIMARY", false) }
       local away = build(1)
       assert.is_false(away:unmirror("PRIMARY"))
+    end)
+
+    it("cancels a pending window pull-back even when the screen is gone", function()
+      screens = { screen("SRC"), screen("PRIMARY") }
+      local away = build(2)
+      local w = window()
+      windows = { w }
+      away:mirror("SRC", nil)
+      assert.is_false(away:unmirror("NOPE"))
+      assert.equal(0, timer.pending())
+      timer.advance(10)
+      assert.equal(0, w.ensured)
     end)
 
     it("cancels a pending window pull-back", function()

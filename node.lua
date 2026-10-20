@@ -24,7 +24,8 @@
 --              :unaliased(isAlive) -> static addresses whose node name is not learned yet
 --   activity   ActivitySensor: :start(onChange(active, reason, sync)) :stop() :isLocked() :initial()
 --   away       optional Away (away.lua): :mirror(sourceUuid, targetUuid|nil) -> ok, usedTargetUuid
---              :unmirror(targetUuid) -> ok; used only for displays with cfg.displays[id].whenAway[me] == "mirror"
+--              :unmirror(targetUuid) -> ok, :defaultTarget(excludeUuid|nil) -> uuid|nil;
+--              used only for displays with cfg.displays[id].whenAway[me] == "mirror"
 --   lid        optional LidSensor: :start(onChange(closed), onReady(closed|nil)) :stop() :closed(); used only if
 --              cfg.activity.lid. onReady fires once, after the asynchronous first read of the lid state
 --   now        function() -> integer milliseconds (also the clock for State timestamps)
@@ -77,6 +78,7 @@ function Node.new(cfg, deps)
   self.releasing = {}     -- display id -> true while an async release switch is in flight
   self.mirrored = {}      -- display id -> uuid of the screen it is mirrored onto (whenAway)
   self.mirrorWarned = {}  -- display id -> owner for which a failed mirror was already warned about
+  self.stopWarned = {}    -- display id -> true after a failed unmirror was warned about (reset on success)
   self.active = false
   self.lidClosed = false
   self.running = false
@@ -167,10 +169,34 @@ end
 
 function Node:_stopMirror(id)
   if not self.away:unmirror(self.mirrored[id]) then
-    return self.log.w("cannot stop mirroring " .. id .. ", will retry on the next state change")
+    if not self.stopWarned[id] then
+      self.stopWarned[id] = true
+      self.log.w("cannot stop mirroring " .. id .. ", will retry on the next state change")
+    end
+    return
   end
+  self.stopWarned[id] = nil
   self.mirrored[id] = nil
   self.log.i(id .. " is back, mirror stopped")
+end
+
+-- A mirror outlives the process that made it (Hammerspoon reload without stop(), a crash): macOS stays
+-- mirrored and the display is missing from the screens. At start a whenAway display that is not among the
+-- screens is therefore treated as possibly mirrored by a previous run: record it, so that the first moment
+-- this node wants its own screens (owner is this node, or not known yet) it is un-mirrored. While another
+-- node owns the display the mirror simply stays; it is not mirrored a second time.
+function Node:_recoverAway()
+  if self.away == nil then return end
+  for id, d in pairs(self.cfg.displays) do
+    if d.whenAway ~= nil and d.whenAway[self.me] == "mirror" and self.displays[id] ~= nil
+        and self.mirrored[id] == nil and self.displays[id]:target() == nil then
+      local uuid = (d.mirrorTo and d.mirrorTo[self.me]) or self.away:defaultTarget(nil)
+      if uuid ~= nil then
+        self.mirrored[id] = uuid
+        self.log.i(id .. " is not among the screens at start, assuming a mirror left by a previous run")
+      end
+    end
+  end
 end
 
 function Node:_stateBody()
@@ -685,6 +711,7 @@ function Node:start()
     function(from) self:_seen(from) end)
   if listening == false then return false, startFailure end
   self.running = true
+  self:_recoverAway()
 
   local useLid = self.cfg.activity ~= nil and self.cfg.activity.lid == true and self.lid ~= nil
   if useLid then

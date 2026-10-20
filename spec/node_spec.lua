@@ -1285,6 +1285,109 @@ describe("whenAway mirror", function()
     assert.is_false(sim:mirrored("desk-mini"))
   end)
 
+  -- A mirror survives a Hammerspoon reload without stop() or a crash: the source screen is then missing
+  -- from the screens at start. desk-mini is built but not started; the stale mirror is simulated.
+  local function staleMirror(owner)
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = { ["desk-mini"] = "mirror" },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start("laptop")
+    sim:advance(1)
+    sim.mirroring["desk-mini"] = true
+    if owner then sim:state("desk-mini"):setOwner("left", owner, sim.now()) end
+    return sim
+  end
+
+  it("M12 a stale mirror at start with the owner already known to be this node is stopped", function()
+    local sim = staleMirror("desk-mini")
+    sim:start("desk-mini")
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_false(sim:node("desk-mini"):status().displays.left.mirrored)
+  end)
+
+  it("M13 a stale mirror at start with an unknown owner is stopped at once", function()
+    local sim = staleMirror()
+    sim:start("desk-mini")
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
+  it("M14 a stale mirror at start while another node owns the display stays, without a second mirror", function()
+    local sim = staleMirror("laptop")
+    sim:start("desk-mini")
+    sim:advance(100)
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+    assert.is_true(sim:node("desk-mini"):status().displays.left.mirrored)
+    -- and it is stopped when the owner comes back
+    sim:activate("laptop")
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
+  it("M15 a stale mirror is stopped when this node becomes the owner later", function()
+    local sim = staleMirror("laptop")
+    sim:start("desk-mini")
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(5)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.is_false(sim:mirrored("desk-mini"))
+  end)
+
+  it("M16 a display that is visible at start gets no recovery unmirror", function()
+    local sim = makeMirror()
+    assert.equal(0, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:mirrorCalls("desk-mini").mirror)
+  end)
+
+  it("M17 a persistently failing unmirror warns once, not on every state change", function()
+    local sim = laptopOwns()
+    sim.unmirrorFails["desk-mini"] = true
+    sim:lock("laptop")
+    sim:advance(100) -- heartbeats with the same owner keep retrying
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.is_true(sim:mirrorCalls("desk-mini").unmirror > 1)
+    assert.equal(1, #logged(sim, "desk-mini", "w", "cannot stop mirroring left"))
+    sim.unmirrorFails["desk-mini"] = false
+    sim:advance(31)
+    assert.is_false(sim:mirrored("desk-mini"))
+    -- the guard is reset by the success
+    sim:activate("laptop")
+    sim:advance(1)
+    sim.unmirrorFails["desk-mini"] = true
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.equal(2, #logged(sim, "desk-mini", "w", "cannot stop mirroring left"))
+  end)
+
+  it("M4b a quick owner flip laptop -> desk-mini -> laptop costs one extra mirror/unmirror pair", function()
+    local sim = laptopOwns()
+    assert.equal(1, sim:mirrorCalls("desk-mini").mirror)
+    sim:activate("desk-mini")
+    sim:advance(0.5)
+    sim:activate("laptop")
+    sim:advance(0.5)
+    assert.equal("laptop", sim:owner("desk-mini"))
+    assert.equal(2, sim:mirrorCalls("desk-mini").mirror)
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.is_true(sim:mirrored("desk-mini"))
+    sim:advance(120)
+    assert.equal(2, sim:mirrorCalls("desk-mini").mirror)
+    assert.equal(1, sim:mirrorCalls("desk-mini").unmirror)
+  end)
+
   it("M11 after the mirror is stopped, further states do not stop it again", function()
     local sim = laptopOwns()
     sim:lock("laptop")

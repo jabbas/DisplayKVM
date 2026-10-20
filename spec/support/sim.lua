@@ -25,7 +25,10 @@
 --   lid          true enables the lid sensor in the node config
 --   whenAway, mirrorTo   the display options of the same name (node -> "mirror" / screen uuid); every
 --                 node gets a fake `away` whose mirror hides the display from that node (fact F8:
---                 the screen leaves allScreens). sim.mirrorFails[name] = true makes its mirror() fail.
+--                 the screen leaves allScreens). sim.mirrorFails[name] / sim.unmirrorFails[name] = true
+--                 make its mirror() / unmirror() fail; sim.mirroring[name] = true before the node
+--                 starts simulates a mirror left over from a crashed or reloaded run (start only
+--                 the other nodes first: sim:start("laptop")).
 --
 -- DDC: sim.ddcLatency (seconds, default 0.1) is how long an async switchTo takes; sim.ddcApply = "end"
 --   (default) applies the command when it completes, "start" applies it at once and only reports later.
@@ -311,8 +314,10 @@ function Sim:_build(name)
     self.mirroring[name] = true
     return true, targetUuid or "UUID-primary"
   end
+  function away.defaultTarget(_, _) return "UUID-primary" end
   function away.unmirror(_, _)
     self.mirrorCount[name].unmirror = self.mirrorCount[name].unmirror + 1
+    if self.unmirrorFails[name] then return false end
     self.mirroring[name] = false
     return true
   end
@@ -403,7 +408,7 @@ function Sim.new(opts)
   for _, node in ipairs(opts.nodes) do self.ddcCount[node] = 0 end
   self.lidEnabled = opts.lid == true
   self.whenAway, self.mirrorTo = opts.whenAway, opts.mirrorTo
-  self.mirroring, self.mirrorCount, self.mirrorFails = {}, {}, {}
+  self.mirroring, self.mirrorCount, self.mirrorFails, self.unmirrorFails = {}, {}, {}, {}
   for _, node in ipairs(opts.nodes) do self.mirrorCount[node] = { mirror = 0, unmirror = 0 } end
   self.monitor = newMonitor({
     inputs = opts.monitor.inputs,

@@ -14,6 +14,8 @@
 --   timer     hs.timer-like: doAfter(sec, fn) -> object with :stop()
 --   log       optional {d, i, w, e}
 --   settle    seconds to wait after a mirror before pulling the windows back into bounds (default 2)
+-- Methods: mirror(sourceUuid, targetUuid|nil) -> ok, usedUuid; unmirror(targetUuid) -> ok;
+-- defaultTarget(excludeUuid|nil) -> uuid|nil.
 -- A `screen` has :getUUID() :mirrorOf(other) -> bool :mirrorStop() -> bool; a `window` :ensureIsInScreenBounds().
 
 local Away = {}
@@ -35,15 +37,27 @@ function Away.new(deps)
   }, Away)
 end
 
--- Explicit target uuid, else the primary screen when it is not the source, else the first other screen.
-function Away:_pickTarget(sourceUuid, targetUuid)
-  if targetUuid ~= nil then return self._find(targetUuid) end
+-- The primary screen when it is not `excludeUuid`, else the first other screen.
+function Away:_defaultScreen(excludeUuid)
   local ok, primary = pcall(self._primary)
-  if ok and primary ~= nil and primary:getUUID() ~= sourceUuid then return primary end
+  if ok and primary ~= nil and primary:getUUID() ~= excludeUuid then return primary end
   for _, screen in ipairs(self._all()) do
-    if screen:getUUID() ~= sourceUuid then return screen end
+    if screen:getUUID() ~= excludeUuid then return screen end
   end
   return nil
+end
+
+-- Explicit target uuid, else the default screen.
+function Away:_pickTarget(sourceUuid, targetUuid)
+  if targetUuid ~= nil then return self._find(targetUuid) end
+  return self:_defaultScreen(sourceUuid)
+end
+
+-- Uuid of the screen `mirror(source, nil)` would use, or nil. Used to guess where a mirror left over from
+-- a previous run points when the source screen (hence its uuid) is not visible any more.
+function Away:defaultTarget(excludeUuid)
+  local screen = self:_defaultScreen(excludeUuid)
+  return screen ~= nil and screen:getUUID() or nil
 end
 
 function Away:_cancelSettle()
@@ -74,6 +88,12 @@ function Away:mirror(sourceUuid, targetUuid)
     self._log.d("cannot mirror: no screen to mirror " .. tostring(sourceUuid) .. " onto")
     return false
   end
+  -- Without the target's uuid nobody could stop the mirror again, so do not start it.
+  local used = target:getUUID()
+  if used == nil then
+    self._log.d("cannot mirror: the target screen has no uuid")
+    return false
+  end
   local ok, result = pcall(source.mirrorOf, source, target)
   if not ok or not result then
     self._log.d("mirrorOf failed: " .. tostring(result))
@@ -81,17 +101,17 @@ function Away:mirror(sourceUuid, targetUuid)
   end
   self:_cancelSettle()
   self._settleTimer = self._timer.doAfter(self._settle, function() self:_pullWindowsBack() end)
-  return true, target:getUUID()
+  return true, used
 end
 
 -- Stops the mirror; as measured (F8) mirrorStop is called on the screen that was mirrored onto.
 function Away:unmirror(targetUuid)
+  self:_cancelSettle()
   local target = self._find(targetUuid)
   if target == nil then
     self._log.d("cannot stop mirroring: screen " .. tostring(targetUuid) .. " not found")
     return false
   end
-  self:_cancelSettle()
   local ok, result = pcall(target.mirrorStop, target)
   if not ok or not result then
     self._log.d("mirrorStop failed: " .. tostring(result))
