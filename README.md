@@ -261,7 +261,8 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
 - Mirror recovery after a crash, or a Hammerspoon reload without `stop()`, is a heuristic: a `whenAway` display
   that is missing from the screens at start is assumed to have been mirrored by the previous run. It is
   un-mirrored the first moment this node owns the display (with a 5 second grace period while the owner is not
-  known yet).
+  known yet, longer while a claim of a node outside `control` waits for a node in `control` to be found, up to
+  about 22 seconds).
 - DDC from a Mac whose input is not active is firmware-dependent; some monitors ignore it (use `pull = false`).
 - Clocks must be NTP-synchronised (messages older than 30 s are rejected).
 - LAN only, and macOS only.

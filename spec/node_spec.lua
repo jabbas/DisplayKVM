@@ -1816,3 +1816,131 @@ describe("state recovery without DDC", function()
     assert.equal(0, sim:ddcCalls("studio"))
   end)
 end)
+
+-- A reload of the home node (no DDC, whenAway mirror) while the laptop owns the display: the new process has
+-- an empty state and has heard nobody yet. It must not take the "no controller reachable" shortcut before
+-- discovery had a chance; it has to ask the laptop once the laptop is heard.
+describe("reload of a node without DDC before discovery", function()
+  local function laptopOwns()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = { ["desk-mini"] = "mirror" },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" },
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    assert.is_true(sim:mirrored("desk-mini"))
+    return sim
+  end
+
+  -- Hammerspoon reload: a new process, and the mirror of the previous run is still there. Discovery is
+  -- delayed: neither node hears of the other until sim:announce().
+  local function reload(sim, o)
+    o = o or {}
+    sim:node("desk-mini"):stop()
+    sim.mirroring["desk-mini"] = true -- a reload does not run stop(): the mirror survives
+    sim.mute["desk-mini"], sim.mute.laptop = true, true
+    if o.unlocked then
+      sim:setLocked("desk-mini", false)
+      sim:setIdle("desk-mini", 0)
+    end
+    sim:restart("desk-mini")
+    return {
+      mirror = sim:mirrorCalls("desk-mini").mirror,
+      unmirror = sim:mirrorCalls("desk-mini").unmirror,
+      requests = requests(sim, "desk-mini"),
+    }
+  end
+
+  -- The laptop's Bonjour announcement reaches desk-mini.
+  local function announce(sim)
+    sim.mute["desk-mini"], sim.mute.laptop = nil, nil
+    sim:hello("laptop")
+  end
+
+  local triggers = {
+    { name = "an active start", reload = { unlocked = true }, act = function() end },
+    { name = "an unlock right after start", act = function(sim) sim:activate("desk-mini") end },
+    { name = "claim() right after start", act = function(sim) assert.is_true(sim:node("desk-mini"):claim()) end },
+  }
+
+  for _, t in ipairs(triggers) do
+    it("D1 " .. t.name .. " asks the laptop once it is heard instead of assuming the display is here", function()
+      local sim = laptopOwns()
+      local before = reload(sim, t.reload)
+      t.act(sim)
+      sim:advance(1.5)
+      assert.is_nil(sim:owner("desk-mini"))
+      assert.is_true(sim:mirrored("desk-mini"))
+      announce(sim)
+      sim:advance(1)
+      assert.same({}, logged(sim, "desk-mini", "i", "no controller reachable"))
+      assert.equal(17, sim:input())
+      allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+      local sent = sim:sent({ from = "desk-mini", type = "request" })
+      assert.equal(before.requests + 1, #sent)
+      assert.equal("laptop", sent[#sent].to)
+      assert.same({ display = "left", to = "desk-mini" }, sent[#sent].body)
+      assert.is_false(sim:mirrored("desk-mini"))
+      assert.equal(before.unmirror + 1, sim:mirrorCalls("desk-mini").unmirror)
+      assert.equal(before.mirror, sim:mirrorCalls("desk-mini").mirror)
+      assert.equal(0, sim:ddcCalls("desk-mini"))
+      sim:advance(30)
+      assert.equal(0, sim:notified("claim-failed"))
+      assert.same({}, sim:node("desk-mini").intents)
+    end)
+  end
+
+  it("D2 the suspected mirror is kept past the grace period while the claim waits for discovery", function()
+    local sim = laptopOwns()
+    local before = reload(sim, { unlocked = true })
+    sim:advance(7) -- longer than the 5 s grace period
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.equal(before.unmirror, sim:mirrorCalls("desk-mini").unmirror)
+    announce(sim)
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(before.unmirror + 1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(before.mirror, sim:mirrorCalls("desk-mini").mirror)
+  end)
+
+  it("D3 nobody is ever heard: the display is assumed here after the last attempt, without an error", function()
+    local sim = laptopOwns()
+    sim:partition("laptop", true)
+    local before = reload(sim, { unlocked = true })
+    sim:advance(20) -- the fifth attempt is at 2 + 4 + 8 + 8 = 22 s
+    assert.is_nil(sim:owner("desk-mini"))
+    assert.is_true(sim:mirrored("desk-mini"))
+    assert.same({}, logged(sim, "desk-mini", "i", "no controller reachable"))
+    sim:advance(3)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.equal(1, #logged(sim, "desk-mini", "i", "no controller reachable for left"))
+    assert.same({}, logged(sim, "desk-mini", "e", "cannot claim"))
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({}, sim:node("desk-mini").intents)
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(before.unmirror + 1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("D4 a lock while the claim waits for discovery ends the wait and stops the suspected mirror", function()
+    local sim = laptopOwns()
+    sim:partition("laptop", true)
+    local before = reload(sim, { unlocked = true })
+    sim:advance(7)
+    assert.is_true(sim:mirrored("desk-mini"))
+    sim:lock("desk-mini")
+    assert.is_false(sim:mirrored("desk-mini"))
+    assert.equal(before.unmirror + 1, sim:mirrorCalls("desk-mini").unmirror)
+    assert.same({}, sim:node("desk-mini").intents)
+  end)
+end)

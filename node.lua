@@ -156,8 +156,10 @@ function Node:_syncAway()
         self:_startMirror(id, owner, d.mirrorTo and d.mirrorTo[self.me])
       elseif not want and self.mirrored[id] ~= nil then
         -- Right after a reload the state is empty: wait to hear who owns the display instead of
-        -- un-mirroring now only to mirror again when the first peer answers.
-        if self.suspected[id] and owner == nil and self.awayGrace then
+        -- un-mirroring now only to mirror again when the first peer answers. A claim that waits for
+        -- discovery (see _assumeHere) extends that wait until it is resolved.
+        local intent = self.intents[id]
+        if self.suspected[id] and owner == nil and (self.awayGrace or (intent ~= nil and intent.waiting)) then
           self.log.d("keeping the suspected mirror of " .. id .. " until a peer has been heard")
         else
           self:_stopMirror(id)
@@ -493,6 +495,7 @@ end
 -- One attempt (counted): pull, request to the recorded owner, or request to every alive peer.
 function Node:_attempt(intent)
   if not self:_live(intent) then return end
+  intent.waiting = nil
   if intent.attempts >= MAX_ATTEMPTS then return self:_exhausted(intent) end
   intent.attempts = intent.attempts + 1
 
@@ -522,15 +525,32 @@ function Node:_attempt(intent)
   self:_broadcastRequest(intent, nil)
 end
 
+-- Whether a node that may switch display `id` has been heard from since this node started (alive or not).
+function Node:_controllerHeard(id)
+  for name in pairs(self.lastSeen) do
+    if name ~= self.me and self:_canSwitch(id, name) then return true end
+  end
+  return false
+end
+
 -- A node outside `control` whose claim reached no controller (none alive, or none answered). When the
 -- state already names this node as the owner, or names nobody and this node is the display's home, the
 -- monitor is most likely on this node's input (it fell back to home on its own, F7): record that, drop the
 -- intent and stay quiet. When the state names ANOTHER owner there is a real failure, so it returns false.
+-- Right after start the state is empty because nothing has been heard yet, not because the controllers
+-- are gone: while no controller has been heard since start, "names nobody" is not trusted before the last
+-- attempt. The claim is then marked `waiting` and retried, at once when a peer is heard (_peerHeard).
 function Node:_assumeHere(intent)
   local id = intent.id
   if self:_canSwitch(id, self.me) then return false end
   local owner = self.state:owner(id)
   if not (owner == self.me or (owner == nil and self.cfg.displays[id].home == self.me)) then return false end
+  if owner == nil and intent.attempts < MAX_ATTEMPTS and not self:_controllerHeard(id) then
+    self.log.d("no node with control for " .. id .. " heard since start yet, waiting for discovery")
+    intent.waiting = true
+    return false
+  end
+  intent.waiting = nil
   self.log.i("no controller reachable for " .. id .. "; assuming it shows this node")
   if owner ~= self.me then
     self:_writeOwner(id, self.me)
@@ -635,6 +655,23 @@ function Node:_ownerReturned(node)
   for _, id in ipairs(ids) do self:_startClaim(id) end
 end
 
+-- A peer's state has just been merged. Claims waiting for discovery (see _assumeHere) whose controller is
+-- now known try again at once instead of on their retry timer. Then the whenAway rule is applied.
+function Node:_peerHeard()
+  local ids = {}
+  for id, intent in pairs(self.intents) do
+    if intent.waiting and self:_controllerHeard(id) then ids[#ids + 1] = id end
+  end
+  table.sort(ids)
+  for _, id in ipairs(ids) do
+    local intent = self.intents[id]
+    if intent.timer then intent.timer:stop() intent.timer = nil end
+    self.log.d("a node with control for " .. id .. " was heard, claiming again")
+    self:_attempt(intent)
+  end
+  self:_awayHeard()
+end
+
 -- ---------------------------------------------------------------- activity
 
 function Node:_markActive()
@@ -658,6 +695,8 @@ function Node:_onInactive(reason, sync)
   self.active = false
   self:_cancelIntents("inactive")
   self:_setPresence(false)
+  -- A cancelled claim that waited for discovery no longer holds a suspected mirror (see _syncAway).
+  self:_syncAway()
 
   local alive = function(name) return self:alive(name) end
   local targets = self.policy.onInactive(self.state, self.cfg, self.me, alive)
@@ -787,7 +826,7 @@ function Node:_sendHello(name)
     if not ok then return self.log.d("hello to " .. tostring(name) .. " failed: " .. tostring(status)) end
     if type(reply) == "table" then
       self.state:merge(reply.state)
-      self:_awayHeard()
+      self:_peerHeard()
     end
     if self.lastSeenFrom then self:_ownerReturned(self.lastSeenFrom) end
   end)
@@ -826,12 +865,12 @@ function Node:onMessage(msg)
   local body = type(msg.body) == "table" and msg.body or {}
   if msg.type == "hello" then
     self.state:merge(body.state)
-    self:_awayHeard()
+    self:_peerHeard()
     self:_ownerReturned(from)
     return 200, self:_stateBody()
   elseif msg.type == "state" then
     self.state:merge(body.state)
-    self:_awayHeard()
+    self:_peerHeard()
     return 204, nil
   elseif msg.type == "request" then
     return 200, self:_handleRequest(body)
