@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1]
+
+### Fixed
+
+- A node outside `control` that claims a display right after a start or Hammerspoon reload (an active start,
+  an unlock or the hotkey) no longer takes it for granted that the display shows it ("no controller reachable
+  for ...; assuming it shows this node") before it has heard from any node in `control`. The claim now waits
+  for discovery and sends its `request` to the controller as soon as one is heard, so the monitor is really
+  switched instead of the state naming the home node while the monitor still shows another node. The
+  assumption is only made after the last attempt (about 22 seconds), still without an error or a
+  notification. A mirror left by the previous run is kept while such a claim waits.
+
 ## [0.2.0]
 
 ### Added
@@ -75,6 +87,7 @@ Initial release (tagged `v0.1.0`).
 - Backends: `m1ddc`, `ddcctl`, `betterdisplay`, `lunar`, or a user function.
 - Installable with SpoonInstall (`dist` branch) or git.
 
+[0.2.1]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.1
 [0.2.0]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.0
 [0.1.1]: https://github.com/jabbas/DisplayKVM/releases/tag/0.1.1
 [0.1.0]: https://github.com/jabbas/DisplayKVM/releases/tag/v0.1.0

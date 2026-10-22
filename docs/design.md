@@ -1,6 +1,6 @@
 # DisplayKVM — design
 
-- **Status:** Approved, 2026-10-12; extended for 0.2.0 (`control`, `whenAway` mirror, state recovery without DDC — §5, §7.4, §9, §10, §13)
+- **Status:** Approved, 2026-10-12; extended for 0.2.0 (`control`, `whenAway` mirror, state recovery without DDC — §5, §7.4, §9, §10, §13); 0.2.1: claims right after start wait for discovery (§7.4)
 - **Scope:** a Hammerspoon Spoon that shares M external monitors between N Macs
 
 ## 1. Summary
