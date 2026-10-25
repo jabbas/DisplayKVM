@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2]
+
+Housekeeping: switching behaves exactly as in 0.2.1; only logs, notifications and docs change.
+
+### Changed
+
+- A claim whose display is still not connected to this Mac while no other node is reachable (for example a laptop
+  away from home) no longer ends with the error `cannot claim <display>` and a notification on every unlock. It keeps
+  its retries and ends with one info line, "<display> is not connected here and no other node is reachable; not
+  claiming". With any other node alive a failed claim is still an error with a notification.
+
+### Added
+
+- One info log line per successful switch on each node involved: a pull (`switched left to laptop
+  (screensDidUnlock)`), a claim granted through `request` (`left switched to desk-mini by laptop`), the `request`
+  served on the controller (`switched left to desk-mini for desk-mini`), a release (`switched left to desk-mini
+  (release: screensDidLock)`) and a release handed to a node in `control` (`left switched to laptop via laptop
+  (release: ...)`). Failed and suppressed switches add no line. The previous separate info line "release of ...
+  landed but ... owns it now" is now part of the release's switch line.
+
+### Documentation
+
+- Turning the monitor's automatic input switching off (Auto-Switch Input and related USB-C options) is now
+  recommended in every setup; 0.2.0 and 0.2.1 recommended keeping it on for `control` / `whenAway` setups. With it
+  on, a monitor can jump to another Mac's input when the current one blanks its display, or bounce back when the
+  DDC switch arrives before the new Mac's video is up. The trade-off (an unplugged cable leaves the monitor on that
+  input until it is switched with its buttons) is described in the README.
+- Known limitations: a DDC backend such as `m1ddc` reports success even when the monitor ignored or undid the change,
+  which DisplayKVM cannot detect on a monitor that stays listed on every input.
+
 ## [0.2.1]
 
 ### Fixed
@@ -87,6 +117,7 @@ Initial release (tagged `v0.1.0`).
 - Backends: `m1ddc`, `ddcctl`, `betterdisplay`, `lunar`, or a user function.
 - Installable with SpoonInstall (`dist` branch) or git.
 
+[0.2.2]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.2
 [0.2.1]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.1
 [0.2.0]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.0
 [0.1.1]: https://github.com/jabbas/DisplayKVM/releases/tag/0.1.1

@@ -29,7 +29,7 @@ obj.__index = obj
 
 -- Metadata
 obj.name = "DisplayKVM"
-obj.version = "0.2.1"
+obj.version = "0.2.2"
 obj.author = "Grzegorz Dzięgielewski <jabbas@jabbas.eu>"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 obj.homepage = "https://github.com/jabbas/DisplayKVM"
