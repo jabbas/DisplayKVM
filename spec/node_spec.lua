@@ -321,7 +321,9 @@ describe("Node scenarios", function()
     local sim = make()
     sim:activate("laptop")
     sim:advance(1)
-    sim:partition("laptop", true)
+    -- The laptop stays alive but cannot switch. (A partitioned laptop would be silent for more than 90 s by
+    -- the third round, and a claim with the display absent and nobody alive ends quietly since 0.2.2.)
+    sim.monitor.failing = true
     sim:activate("desk-mini")
     sim:advance(30)
     assert.equal(1, sim:notified("claim-failed"))
@@ -1942,5 +1944,84 @@ describe("reload of a node without DDC before discovery", function()
     assert.is_false(sim:mirrored("desk-mini"))
     assert.equal(before.unmirror + 1, sim:mirrorCalls("desk-mini").unmirror)
     assert.same({}, sim:node("desk-mini").intents)
+  end)
+end)
+
+-- The laptop is away from home: the monitor is not connected to it and no other node is on the network. The
+-- claim keeps its retry schedule (on a detaching monitor "not visible" is also normal while another node shows
+-- its input, and right after a wake the network may come up late), but its end is not an error.
+describe("claim with the display absent and nobody reachable", function()
+  -- Lines of `node` at `level` (all of them).
+  local function lines(sim, node, level)
+    local out = {}
+    for _, line in ipairs(sim.logLines) do
+      local who, lvl, msg = line:match("^(%S+) (%a) (.*)$")
+      if who == node and lvl == level then out[#out + 1] = msg end
+    end
+    return out
+  end
+
+  local function laptopAlone()
+    local sim = make({ delayed = true }) -- detaching monitor on desk-mini's input: not visible to the laptop
+    sim:start("laptop")
+    sim:advance(1)
+    return sim
+  end
+
+  it("Q1 ends after the full retry schedule with one info line, no error and no notification", function()
+    local sim = laptopAlone()
+    local infoBefore = #lines(sim, "laptop", "i")
+    sim:activate("laptop")
+    sim:advance(21) -- the fifth attempt is at 22 s
+    assert.same({ "active (screensDidUnlock)" }, { table.unpack(lines(sim, "laptop", "i"), infoBefore + 1) })
+    sim:advance(10)
+    assert.same({}, lines(sim, "laptop", "e"))
+    assert.same({}, lines(sim, "laptop", "w"))
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({
+      "active (screensDidUnlock)",
+      "left is not connected here and no other node is reachable; not claiming",
+    }, { table.unpack(lines(sim, "laptop", "i"), infoBefore + 1) })
+    assert.equal(5, #logged(sim, "laptop", "d", "no alive peer to ask for left")) -- the retries are unchanged
+    assert.is_nil(sim:owner("laptop"))
+    assert.equal(15, sim:input())
+    assert.is_true(sim:node("laptop").intents.left.exhausted) -- as before: exhausted, restarted by the next unlock
+  end)
+
+  it("Q1b every unlock gets the same quiet end, never a notification", function()
+    local sim = laptopAlone()
+    for _ = 1, 3 do
+      sim:activate("laptop")
+      sim:advance(30)
+      sim:lock("laptop")
+      sim:advance(1)
+    end
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({}, lines(sim, "laptop", "e"))
+    assert.equal(3, #logged(sim, "laptop", "i", "not connected here and no other node is reachable"))
+  end)
+
+  it("Q2 a peer that is alive but cannot help still makes it an error with a notification", function()
+    local sim = make()
+    sim.monitor.failing = true -- desk-mini sees the display, but its switch fails
+    sim:activate("laptop")
+    sim:advance(30)
+    assert.is_true(sim:node("laptop"):alive("desk-mini"))
+    assert.equal(1, #logged(sim, "laptop", "e", "cannot claim left"))
+    assert.equal(1, sim:notified("claim-failed", "laptop"))
+    assert.same({}, logged(sim, "laptop", "i", "not connected here"))
+  end)
+
+  it("Q3 a peer that turns up during the retries grants the claim as before", function()
+    local sim = laptopAlone()
+    sim:activate("laptop")
+    sim:advance(3)
+    sim:start("desk-mini")
+    sim:advance(10)
+    assert.equal(16, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "laptop")
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({}, logged(sim, "laptop", "i", "not connected here"))
+    assert.same({}, sim:node("laptop").intents)
   end)
 end)

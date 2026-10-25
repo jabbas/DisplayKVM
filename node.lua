@@ -639,9 +639,22 @@ function Node:_retry(intent)
   end)
 end
 
+-- Whether any other node is alive, capable of switching or not.
+function Node:_anyPeerAlive()
+  for name in pairs(self.lastSeen) do
+    if name ~= self.me and self:alive(name) then return true end
+  end
+  return false
+end
+
 function Node:_exhausted(intent)
   if self:_assumeHere(intent) then return end
   intent.exhausted = true
+  -- Away from home: the monitor is not connected here and there is nobody to ask. Nothing is wrong, so
+  -- the claim ends quietly. With any peer alive a failed claim may be a real problem and stays an error.
+  if not self.displays[intent.id]:visible() and not self:_anyPeerAlive() then
+    return self.log.i(intent.id .. " is not connected here and no other node is reachable; not claiming")
+  end
   self.log.e("cannot claim " .. intent.id)
   self:_notify("claim-failed", "cannot claim " .. intent.id)
 end
