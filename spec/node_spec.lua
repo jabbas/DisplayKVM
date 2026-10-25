@@ -2025,3 +2025,118 @@ describe("claim with the display absent and nobody reachable", function()
     assert.same({}, sim:node("laptop").intents)
   end)
 end)
+
+-- Every successful switch caused by a node is logged once at info level by each node involved.
+describe("switch log lines", function()
+  local function switchLines(sim, node)
+    return logged(sim, node, "i", "switched")
+  end
+
+  it("W1 a pull on unlock: one line on the claiming node, none elsewhere", function()
+    local sim = make({ mode = "sticky", acceptsInactive = true })
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.same({ "switched left to laptop (screensDidUnlock)" }, switchLines(sim, "laptop"))
+    assert.same({}, switchLines(sim, "desk-mini"))
+  end)
+
+  it("W1b a manual claim (hotkey) names itself as the reason", function()
+    local sim = make({ mode = "sticky", acceptsInactive = true })
+    sim:node("laptop"):claim()
+    sim:advance(1)
+    assert.same({ "switched left to laptop (manual claim)" }, switchLines(sim, "laptop"))
+  end)
+
+  it("W2 a request: the controller logs the switch it served, the requester the grant", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(5)
+    assert.equal(15, sim:input())
+    -- detaching monitor: each claim goes through a request to the node that sees the display
+    assert.same({ "switched left to laptop for laptop", "left switched to desk-mini by laptop" },
+      switchLines(sim, "desk-mini"))
+    assert.same({ "left switched to laptop by desk-mini", "switched left to desk-mini for desk-mini" },
+      switchLines(sim, "laptop"))
+  end)
+
+  it("W3 a release on lock: one line on the releasing node", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.same({ "left switched to laptop by desk-mini", "switched left to desk-mini (release: screensDidLock)" },
+      switchLines(sim, "laptop"))
+    assert.same({ "switched left to laptop for laptop" }, switchLines(sim, "desk-mini"))
+  end)
+
+  it("W3b a release on sleep (synchronous): one line", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:sleep("laptop")
+    assert.equal(1, #logged(sim, "laptop", "i", "switched left to desk-mini (release: systemWillSleep)"))
+  end)
+
+  it("W4 a delegated release from a node outside control: 'via' on it, 'for' on the controller", function()
+    local sim = make({
+      mode = "sticky", acceptsInactive = true, control = { "laptop" }, noDdc = { "desk-mini" },
+    })
+    sim:activate("laptop")
+    sim:advance(1)
+    sim:activate("desk-mini")
+    sim:advance(1)
+    sim:lock("desk-mini")
+    sim:advance(1)
+    assert.equal(16, sim:input())
+    assert.same({
+      "left switched to desk-mini by laptop",
+      "left switched to laptop via laptop (release: screensDidLock)",
+    }, switchLines(sim, "desk-mini"))
+    assert.same({
+      "switched left to laptop (screensDidUnlock)",
+      "switched left to desk-mini for desk-mini",
+      "switched left to laptop for desk-mini",
+    }, switchLines(sim, "laptop"))
+  end)
+
+  for _, burst in ipairs({
+    { name = "lock then sleep", run = function(sim) sim:lock("laptop") sim:sleep("laptop") end },
+    { name = "lid close then lock", lid = true, run = function(sim) sim:lid("laptop", true) sim:lock("laptop") end },
+    { name = "lock twice", run = function(sim) sim:lock("laptop") sim:lock("laptop") end },
+  }) do
+    it("W5 an inactivity burst (" .. burst.name .. ") logs one switch line for its one switch", function()
+      local sim = make({ lid = burst.lid })
+      sim:activate("laptop")
+      sim:advance(1)
+      local applied = sim.monitor.applied
+      burst.run(sim)
+      sim:advance(5)
+      assert.equal(applied + 1, sim.monitor.applied)
+      assert.equal(1, #logged(sim, "laptop", "i", "switched left to desk-mini (release: "))
+    end)
+  end
+
+  it("W6 a pull that lands after going inactive: its own line, then the release line", function()
+    local sim = make({ mode = "sticky", acceptsInactive = true })
+    sim:activate("laptop")
+    sim:lock("laptop") -- the pull is still in flight
+    sim:advance(5)
+    assert.equal(15, sim:input())
+    assert.same({ "claim of left landed after going inactive, releasing it" }, logged(sim, "laptop", "i", "landed"))
+    assert.same({ "switched left to desk-mini (release: late claim)" }, switchLines(sim, "laptop"))
+  end)
+
+  it("W7 failures and suppressed releases add no switch line", function()
+    local sim = make()
+    sim:activate("laptop")
+    sim:advance(1)
+    sim.monitor.input = 15 -- switched away behind the laptop's back: the release finds it not visible
+    sim:lock("laptop")
+    sim:advance(5)
+    assert.same({ "left switched to laptop by desk-mini" }, switchLines(sim, "laptop"))
+    assert.equal(1, #logged(sim, "laptop", "i", "already handed over"))
+  end)
+end)

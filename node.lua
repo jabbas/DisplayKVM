@@ -58,6 +58,12 @@ local WIRE_REASONS = {
 
 local noop = function() end
 
+-- " (<reason>)", or "" without a reason. For the one info line per successful switch.
+local function because(reason)
+  if reason == nil then return "" end
+  return " (" .. tostring(reason) .. ")"
+end
+
 function Node.new(cfg, deps)
   local self = setmetatable({}, Node)
   self.cfg = cfg
@@ -396,9 +402,10 @@ function Node:_cancelIntents(why)
   for id in pairs(self.intents) do self:_cancelIntent(id, why) end
 end
 
-function Node:_startClaim(id)
+-- `reason`: what started the claim (an activity reason, "manual claim", ...), only for the log.
+function Node:_startClaim(id, reason)
   self:_cancelIntent(id)
-  local intent = { id = id, attempts = 0 }
+  local intent = { id = id, attempts = 0, reason = reason }
   self.intents[id] = intent
   self:_attempt(intent)
 end
@@ -439,7 +446,7 @@ function Node:_controlTargets(id)
 end
 
 -- Switches display `id` to `target` through a capable peer: sends `request {display, to = target}` to the
--- targets of _controlTargets one after the other; the first ok wins. cb(true), or cb(false, reason, peer)
+-- targets of _controlTargets one after the other; the first ok wins. cb(true, nil, peer), or cb(false, reason, peer)
 -- when there is no target ("no-controller") or all of them refused or did not answer (the reason and the
 -- name of the last one).
 function Node:_delegate(id, target, cb)
@@ -454,7 +461,7 @@ function Node:_delegate(id, target, cb)
     end
     self.transport:send(peer, "request", { display = id, to = target }, function(ok, reply, status)
       if not self.running then return end
-      if ok and type(reply) == "table" and reply.result == "ok" then return cb(true) end
+      if ok and type(reply) == "table" and reply.result == "ok" then return cb(true, nil, peer) end
       local why = type(reply) == "table" and reply.reason or status
       self.log.d("delegated switch of " .. id .. " via " .. tostring(peer) .. " failed: " .. tostring(why))
       try(i + 1, peer, why)
@@ -463,7 +470,7 @@ function Node:_delegate(id, target, cb)
   try(1)
 end
 
--- Sends `request` to every target at once; cb(true) on the first ok, cb(false) when all failed.
+-- Sends `request` to every target at once; cb(true, peer) on the first ok, cb(false) when all failed.
 function Node:_ask(intent, targets, cb)
   local pending, settled = #targets, false
   for _, peer in ipairs(targets) do
@@ -480,7 +487,7 @@ function Node:_ask(intent, targets, cb)
       pending = pending - 1
       if granted then
         settled = true
-        return cb(true)
+        return cb(true, peer)
       end
       local why = type(reply) == "table" and reply.reason or status
       self.log.d("request to " .. tostring(peer) .. " for " .. intent.id .. " failed: " .. tostring(why))
@@ -516,8 +523,8 @@ function Node:_attempt(intent)
 
   local owner = self.state:owner(id)
   if owner ~= nil and owner ~= self.me and self:alive(owner) and self:_canSwitch(id, owner) then
-    self:_ask(intent, { owner }, function(ok)
-      if ok then return self:_claimed(intent, true) end
+    self:_ask(intent, { owner }, function(ok, peer)
+      if ok then return self:_claimed(intent, peer) end
       self:_fallback(intent, owner)
     end)
     return
@@ -567,8 +574,8 @@ function Node:_broadcastRequest(intent, skip)
     if self:_assumeHere(intent) then return end
     return self:_retry(intent)
   end
-  self:_ask(intent, targets, function(ok)
-    if ok then return self:_claimed(intent, true) end
+  self:_ask(intent, targets, function(ok, peer)
+    if ok then return self:_claimed(intent, peer) end
     self:_retry(intent)
   end)
 end
@@ -594,10 +601,16 @@ function Node:_lateClaim(intent)
   for _, t in ipairs(self.policy.onInactive(self.state, self.cfg, self.me, alive)) do
     if t.display == id then targets[#targets + 1] = t end
   end
-  self:_releaseAsync(targets)
+  self:_releaseAsync(targets, "late claim")
 end
 
+-- `viaRequest`: the peer that granted the claim's `request`, nil for a pull.
 function Node:_claimed(intent, viaRequest)
+  if viaRequest then
+    self.log.i(intent.id .. " switched to " .. self.me .. " by " .. tostring(viaRequest))
+  else
+    self.log.i("switched " .. intent.id .. " to " .. self.me .. because(intent.reason))
+  end
   self:_writeOwner(intent.id, self.me)
   self:_broadcast()
   -- A node that mirrors the display while it is away (whenAway) sees it reappear only after the mirror
@@ -665,7 +678,7 @@ function Node:_ownerReturned(node)
   for id, intent in pairs(self.intents) do
     if intent.exhausted and self.state:owner(id) == node then ids[#ids + 1] = id end
   end
-  for _, id in ipairs(ids) do self:_startClaim(id) end
+  for _, id in ipairs(ids) do self:_startClaim(id, tostring(node) .. " is back") end
 end
 
 -- A peer's state has just been merged. Claims waiting for discovery (see _assumeHere) whose controller is
@@ -699,7 +712,7 @@ function Node:_onActive(reason)
   self:_markActive()
   for _, id in ipairs(self.policy.onActive(self.state, self.cfg, self.me)) do
     local intent = self.intents[id]
-    if intent == nil or intent.exhausted then self:_startClaim(id) end
+    if intent == nil or intent.exhausted then self:_startClaim(id, reason) end
   end
 end
 
@@ -721,6 +734,7 @@ function Node:_onInactive(reason, sync)
         -- is idempotent and the async one may be suspended by the sleep.
         local ok, why = self.displays[t.display]:switchToSync(t.target, SLEEP_SWITCH_TIMEOUT)
         if ok then
+          self.log.i("switched " .. t.display .. " to " .. t.target .. " (release: " .. tostring(reason) .. ")")
           self:_writeOwner(t.display, t.target)
         else
           self:_releaseFailed(t.display, why)
@@ -734,12 +748,12 @@ function Node:_onInactive(reason, sync)
     -- asynchronous (there is no blocking request/reply primitive that returns the peer's verdict): such a
     -- node is in practice a desktop that does not sleep while its owner is away. If the machine does
     -- suspend before the answer, the peer's own recovery (R3) and the next claim put the state right.
-    self:_releaseAsync(delegated)
+    self:_releaseAsync(delegated, reason)
     return
   end
 
   self:_broadcast()
-  self:_releaseAsync(targets)
+  self:_releaseAsync(targets, reason)
 end
 
 -- A failed release is only an error when the monitor still shows this node. `not-visible` means it
@@ -774,8 +788,9 @@ end
 -- Async release of {display, target} pairs. At most one per display is in flight; a second inactivity
 -- event meanwhile (lock, then sleep or lid close) adds nothing. When the switch lands the situation
 -- may have changed: the node may be active again (claim afresh, the monitor now shows the target) or a
--- peer may have taken the display meanwhile (leave its owner record alone).
-function Node:_releaseAsync(targets)
+-- peer may have taken the display meanwhile (leave its owner record alone). `reason`: what started the
+-- release (an inactivity reason, "late claim"), only for the log.
+function Node:_releaseAsync(targets, reason)
   for _, t in ipairs(targets) do
     local id = t.display
     if self.releasing[id] then
@@ -790,12 +805,17 @@ function Node:_releaseAsync(targets)
           if delegated then return self:_delegationFailed(id, t.target, why, peer) end
           return self:_releaseFailed(id, why)
         end
-        if self.active then return self:_startClaim(id) end
+        local line = delegated and (id .. " switched to " .. t.target .. " via " .. tostring(peer))
+          or ("switched " .. id .. " to " .. t.target)
+        line = line .. " (release: " .. tostring(reason) .. ")"
         local owner = self.state:owner(id)
-        if owner == t.target then return end -- the controller's broadcast got here before its reply
-        if owner ~= self.me then
-          return self.log.i("release of " .. id .. " landed but " .. tostring(owner) .. " owns it now")
+        if not self.active and owner ~= t.target and owner ~= self.me then
+          -- One line for the switch and for what happened meanwhile.
+          return self.log.i(line .. ", but " .. tostring(owner) .. " owns it now")
         end
+        self.log.i(line)
+        if self.active then return self:_startClaim(id, "active again") end
+        if owner == t.target then return end -- the controller's broadcast got here before its reply
         self:_writeOwner(id, t.target)
         self:_broadcast()
       end)
@@ -845,7 +865,7 @@ function Node:_sendHello(name)
   end)
 end
 
-function Node:_handleRequest(body)
+function Node:_handleRequest(body, from)
   local display = type(body.display) == "string" and self.displays[body.display] or nil
   if display == nil or type(body.to) ~= "string" then
     return { result = "failed", reason = "unknown-display" }
@@ -858,6 +878,7 @@ function Node:_handleRequest(body)
   end
   local ok, reason = display:switchToSync(body.to, REQUEST_SWITCH_TIMEOUT)
   if ok then
+    self.log.i("switched " .. display.id .. " to " .. body.to .. " for " .. tostring(from))
     self:_writeOwner(display.id, body.to)
     self:_broadcast()
     return { result = "ok" }
@@ -886,7 +907,7 @@ function Node:onMessage(msg)
     self:_peerHeard()
     return 204, nil
   elseif msg.type == "request" then
-    return 200, self:_handleRequest(body)
+    return 200, self:_handleRequest(body, from)
   end
   return 404, nil
 end
@@ -970,7 +991,7 @@ function Node:claim(displayId)
     ids = { displayId }
   end
   self:_markActive()
-  for _, id in ipairs(ids) do self:_startClaim(id) end
+  for _, id in ipairs(ids) do self:_startClaim(id, "manual claim") end
   return true
 end
 
