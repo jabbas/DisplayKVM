@@ -4,7 +4,9 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.3]
+
+The monitor's buttons: DisplayKVM now tells you when only they can bring the picture back.
 
 ### Added
 
@@ -144,6 +146,7 @@ Initial release (tagged `v0.1.0`).
 - Backends: `m1ddc`, `ddcctl`, `betterdisplay`, `lunar`, or a user function.
 - Installable with SpoonInstall (`dist` branch) or git.
 
+[0.2.3]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.3
 [0.2.2]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.2
 [0.2.1]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.1
 [0.2.0]: https://github.com/jabbas/DisplayKVM/releases/tag/0.2.0
