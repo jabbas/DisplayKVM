@@ -57,6 +57,103 @@ describe("State", function()
       assert.is_false(State.ownerWins({ node = "desk-mini", ts = 1 }, { node = "laptop", ts = 1 }))
       assert.is_false(State.ownerWins({ node = "laptop", ts = 1 }, { node = "laptop", ts = 1 }))
     end)
+
+    it("on a full tie the assumed record wins over the confirmed one, never the other way", function()
+      assert.is_true(State.ownerWins({ node = "a", ts = 1, assumed = true }, { node = "a", ts = 1 }))
+      assert.is_false(State.ownerWins({ node = "a", ts = 1 }, { node = "a", ts = 1, assumed = true }))
+      assert.is_false(State.ownerWins({ node = "a", ts = 1, assumed = true }, { node = "a", ts = 1, assumed = true }))
+      -- ts and node still come first
+      assert.is_true(State.ownerWins({ node = "a", ts = 2 }, { node = "a", ts = 1, assumed = true }))
+      assert.is_true(State.ownerWins({ node = "b", ts = 1 }, { node = "a", ts = 1, assumed = true }))
+    end)
+  end)
+
+  -- 0.2.3: an owner record written by a recovery rule without any DDC (R3a, R3b) is marked `assumed`.
+  describe("assumed owner records", function()
+    it("is false for a plain write and for an unknown display", function()
+      s:setOwner("left", "laptop", 100)
+      assert.is_false(s:assumed("left"))
+      assert.is_false(s:assumed("right"))
+    end)
+
+    it("is kept with the record and cleared by a newer confirmed write", function()
+      assert.is_true(s:setOwner("left", "desk-mini", 100, true))
+      assert.is_true(s:assumed("left"))
+      assert.equal("desk-mini", (s:owner("left")))
+      assert.is_true(s:setOwner("left", "desk-mini", 110))
+      assert.is_false(s:assumed("left"))
+    end)
+
+    it("goes into the snapshot only when set", function()
+      s:setOwner("left", "desk-mini", 100, true)
+      s:setOwner("right", "laptop", 100)
+      local snap = s:snapshot()
+      assert.same({ node = "desk-mini", ts = 100, assumed = true }, snap.owner.left)
+      assert.same({ node = "laptop", ts = 100 }, snap.owner.right)
+    end)
+
+    it("survives merge and a JSON round trip", function()
+      s:setOwner("left", "desk-mini", 100, true)
+      local other = State.new()
+      other:merge(json.decode(json.encode(s:snapshot())))
+      assert.is_true(other:assumed("left"))
+    end)
+
+    it("is not cleared by a peer that sends the same record back without the flag (0.2.2)", function()
+      s:setOwner("left", "desk-mini", 100, true)
+      assert.same({}, s:merge({ owner = { left = { node = "desk-mini", ts = 100 } } }))
+      assert.is_true(s:assumed("left"))
+    end)
+
+    it("takes the flag of the same record when it arrives later", function()
+      s:setOwner("left", "desk-mini", 100)
+      assert.equal(1, #s:merge({ owner = { left = { node = "desk-mini", ts = 100, assumed = true } } }))
+      assert.is_true(s:assumed("left"))
+    end)
+
+    it("merges a full tie commutatively and in any order of three snapshots", function()
+      local records = {
+        { node = "desk-mini", ts = 100, assumed = true },
+        { node = "desk-mini", ts = 100 },
+        { node = "laptop", ts = 100 },
+        { node = "desk-mini", ts = 90, assumed = true },
+      }
+      local function snap(r) return { owner = { left = r } } end
+      -- every pair, both ways
+      for i = 1, #records do
+        for j = 1, #records do
+          local ab, ba = State.new(), State.new()
+          ab:merge(snap(records[i])) ab:merge(snap(records[j]))
+          ba:merge(snap(records[j])) ba:merge(snap(records[i]))
+          assert.same(ab:snapshot(), ba:snapshot(), i .. "," .. j)
+        end
+      end
+      -- every order of the first three, folded one by one and pre-merged in pairs
+      local orders = { { 1, 2, 3 }, { 1, 3, 2 }, { 2, 1, 3 }, { 2, 3, 1 }, { 3, 1, 2 }, { 3, 2, 1 } }
+      local expected
+      for _, o in ipairs(orders) do
+        local folded = State.new()
+        for _, k in ipairs(o) do folded:merge(snap(records[k])) end
+        local pair = State.new()
+        pair:merge(snap(records[o[2]])) pair:merge(snap(records[o[3]]))
+        local grouped = State.new()
+        grouped:merge(snap(records[o[1]])) grouped:merge(pair:snapshot())
+        expected = expected or folded:snapshot()
+        assert.same(expected, folded:snapshot())
+        assert.same(expected, grouped:snapshot())
+      end
+      assert.same({ node = "laptop", ts = 100 }, expected.owner.left)
+      -- without the greater node name, the assumed record of the tie wins
+      local two = State.new()
+      two:merge(snap(records[2])) two:merge(snap(records[1]))
+      assert.is_true(two:assumed("left"))
+    end)
+
+    it("treats a non-boolean flag as not assumed", function()
+      s:merge({ owner = { left = { node = "desk-mini", ts = 100, assumed = "yes" } } })
+      assert.equal("desk-mini", (s:owner("left")))
+      assert.is_false(s:assumed("left"))
+    end)
   end)
 
   describe("presence register", function()

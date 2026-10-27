@@ -92,6 +92,7 @@ function Node.new(cfg, deps)
   self.stopWarned = {}    -- display id -> true after a failed unmirror was warned about (reset on success)
   self.unmirroredAt = {}  -- display id -> ms when this node last stopped mirroring it (see _checkHeld)
   self.suspected = {}     -- display id -> true while `mirrored` is only a guess made at start
+  self.handWarned = {}    -- display id -> ts of the assumed owner record already warned about (see _assumeHere)
   self.active = false
   self.lidClosed = false
   self.running = false
@@ -132,12 +133,13 @@ function Node:_setPresence(active)
   return self.state:setPresence(self.me, active, ts, ts)
 end
 
--- Owner write. A record that already names this node is superseded, never tied.
-function Node:_writeOwner(id, node)
+-- Owner write. A record that already names this node is superseded, never tied. `assumed`: written by a
+-- recovery rule without any DDC (R3a, R3b), see State:setOwner.
+function Node:_writeOwner(id, node, assumed)
   local ts = self.now()
   local current, currentTs = self.state:owner(id)
   if current == self.me and currentTs >= ts then ts = currentTs + 1 end
-  local changed = self.state:setOwner(id, node, ts)
+  local changed = self.state:setOwner(id, node, ts, assumed)
   self:_syncAway()
   return changed
 end
@@ -286,6 +288,8 @@ local SCREEN_DEBOUNCE = 2
 -- debounce period after this node stopped mirroring it (the screen may take a moment to be listed again; the
 -- check is then repeated by itself). It applies only when the home node cannot switch the display by DDC
 -- itself, which is the premise of the monitor's auto-switch (F7): in a 0.1.x configuration it never fires.
+-- The record is marked `assumed`. With the monitor's auto-switch off (recommended since 0.2.2) the monitor
+-- stays on this node's input with no picture, so the user is told to use the monitor's buttons (0.2.3).
 -- `quiet`: the caller (the heartbeat) sends the state itself, so no broadcast here.
 function Node:_checkHeld(quiet)
   if not self.running then return end
@@ -304,7 +308,11 @@ function Node:_checkHeld(quiet)
         self:_onScreensChanged()
       else
         self.log.i(id .. " disappeared, assuming it switched to " .. home)
-        self:_writeOwner(id, home)
+        self:_writeOwner(id, home, true)
+        self.log.w(id .. " was disconnected while it showed this node; if the monitor has no picture, switch its"
+          .. " input with the monitor's buttons")
+        self:_notify("display-lost", id .. " was disconnected while it showed this Mac. If the monitor has no"
+          .. " picture, switch its input with the monitor's buttons.")
         if not quiet then self:_broadcast() end
       end
     end
@@ -313,7 +321,8 @@ end
 
 -- R3b. The home node cannot run DDC. When the display's owner is gone and so is every node that could
 -- switch it, the monitor has fallen back to the home input on its own: take the ownership in the state.
--- Needs no activity of this node and sends no DDC.
+-- Needs no activity of this node and sends no DDC. The record is marked `assumed` (with the monitor's
+-- auto-switch off it may still show the lost node's input).
 function Node:_recoverHome(quiet)
   if not self.running then return end
   local ids = {}
@@ -325,7 +334,7 @@ function Node:_recoverHome(quiet)
         and owner ~= nil and owner ~= self.me and not self:alive(owner) and not self:_anyControllerAlive(id) then
       self.log.i(string.format("%s: owner %s and every node with control are gone, taking ownership in the state",
         id, owner))
-      self:_writeOwner(id, self.me)
+      self:_writeOwner(id, self.me, true)
       if not quiet then self:_broadcast() end
     end
   end
@@ -547,24 +556,49 @@ end
 -- Right after start the state is empty because nothing has been heard yet, not because the controllers
 -- are gone: while no controller has been heard since start, "names nobody" is not trusted before the last
 -- attempt. The claim is then marked `waiting` and retried, at once when a peer is heard (_peerHeard).
+-- (0.2.3) The same goes for a record naming this node that is only `assumed` (R3a, R3b): nothing has switched
+-- the monitor, so a controller that comes back during the retries (for example after a reboot) gets the
+-- chance to do it; only the last attempt accepts the record, with the warning of _warnByHand.
 function Node:_assumeHere(intent)
   local id = intent.id
   if self:_canSwitch(id, self.me) then return false end
   local owner = self.state:owner(id)
   if not (owner == self.me or (owner == nil and self.cfg.displays[id].home == self.me)) then return false end
-  if owner == nil and intent.attempts < MAX_ATTEMPTS and not self:_controllerHeard(id) then
-    self.log.d("no node with control for " .. id .. " heard since start yet, waiting for discovery")
-    intent.waiting = true
-    return false
+  if intent.attempts < MAX_ATTEMPTS then
+    if owner == nil and not self:_controllerHeard(id) then
+      self.log.d("no node with control for " .. id .. " heard since start yet, waiting for discovery")
+      intent.waiting = true
+      return false
+    end
+    if owner == self.me and self.state:assumed(id) then
+      self.log.d("the record of " .. id .. " is only assumed, waiting for a node with control")
+      intent.waiting = true
+      return false
+    end
   end
   intent.waiting = nil
   self.log.i("no controller reachable for " .. id .. "; assuming it shows this node")
   if owner ~= self.me then
     self:_writeOwner(id, self.me)
     self:_broadcast()
+  elseif self.state:assumed(id) then
+    self:_warnByHand(id)
   end
   self:_cancelIntent(id)
   return true
+end
+
+-- 0.2.3. The record naming this node was only assumed by a recovery rule (R3a, R3b) and no controller could
+-- switch the display now: with the monitor's auto-switch off it may still show the lost node's input with no
+-- picture. Warned once per record (its ts), so neither every unlock nor a later heartbeat repeats it.
+function Node:_warnByHand(id)
+  local _, ts = self.state:owner(id)
+  if self.handWarned[id] == ts then return end
+  self.handWarned[id] = ts
+  self.log.w("no node with control could switch " .. id .. " to this node and nothing confirms it shows it;"
+    .. " if the monitor has no picture, switch its input with the monitor's buttons")
+  self:_notify("switch-by-hand", "Cannot switch " .. id .. " to this Mac. If the monitor has no picture, switch"
+    .. " its input with the monitor's buttons.")
 end
 
 function Node:_broadcastRequest(intent, skip)
@@ -652,21 +686,15 @@ function Node:_retry(intent)
   end)
 end
 
--- Whether any other node is alive, capable of switching or not.
-function Node:_anyPeerAlive()
-  for name in pairs(self.lastSeen) do
-    if name ~= self.me and self:alive(name) then return true end
-  end
-  return false
-end
-
 function Node:_exhausted(intent)
   if self:_assumeHere(intent) then return end
   intent.exhausted = true
-  -- Away from home: the monitor is not connected here and there is nobody to ask. Nothing is wrong, so
-  -- the claim ends quietly. With any peer alive a failed claim may be a real problem and stays an error.
-  if not self.displays[intent.id]:visible() and not self:_anyPeerAlive() then
-    return self.log.i(intent.id .. " is not connected here and no other node is reachable; not claiming")
+  -- The monitor is not connected here and no alive node could switch it (away from home, or at home with the
+  -- cable out and only peers without DDC around). Nothing is wrong, so the claim ends quietly. With a node
+  -- that can switch the display alive, a failed claim may be a real problem and stays an error.
+  if not self.displays[intent.id]:visible() and #self:_requestTargets(intent.id) == 0 then
+    return self.log.i(intent.id .. " is not connected here and no other node that can switch it is reachable;"
+      .. " not claiming")
   end
   self.log.e("cannot claim " .. intent.id)
   self:_notify("claim-failed", "cannot claim " .. intent.id)
@@ -815,7 +843,9 @@ function Node:_releaseAsync(targets, reason)
         end
         self.log.i(line)
         if self.active then return self:_startClaim(id, "active again") end
-        if owner == t.target then return end -- the controller's broadcast got here before its reply
+        -- The controller's broadcast got here before its reply. A record of the same target that is only
+        -- assumed (R3b on the home node while this release was in flight) is confirmed by the switch.
+        if owner == t.target and not self.state:assumed(id) then return end
         self:_writeOwner(id, t.target)
         self:_broadcast()
       end)
@@ -1031,7 +1061,7 @@ function Node:status()
     for i, name in ipairs(list) do control[i] = name end
     displays[id] = {
       owner = self.state:owner(id), visible = display:visible(), input = display:inputFor(self.me), control = control,
-      mirrored = self.mirrored[id] ~= nil,
+      mirrored = self.mirrored[id] ~= nil, assumed = self.state:assumed(id),
     }
   end
   return { node = self.me, instance = self.instance, peers = peers, displays = displays }

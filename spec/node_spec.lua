@@ -1552,6 +1552,9 @@ describe("state recovery without DDC", function()
     assert.equal(before, sim:ddcCalls("laptop"))
     assert.equal(0, sim:ddcCalls("desk-mini"))
     assert.equal(1, #logged(sim, "laptop", "i", "left disappeared, assuming it switched to desk-mini"))
+    -- with the monitor's auto-switch on the notification is redundant but harmless (worded conditionally)
+    assert.equal(1, sim:notified("display-lost", "laptop"))
+    assert.is_true(sim:state("desk-mini"):assumed("left"))
   end)
 
   it("R3a waits 2 s after the last screen change", function()
@@ -1980,7 +1983,7 @@ describe("claim with the display absent and nobody reachable", function()
     assert.equal(0, sim:notified("claim-failed"))
     assert.same({
       "active (screensDidUnlock)",
-      "left is not connected here and no other node is reachable; not claiming",
+      "left is not connected here and no other node that can switch it is reachable; not claiming",
     }, { table.unpack(lines(sim, "laptop", "i"), infoBefore + 1) })
     assert.equal(5, #logged(sim, "laptop", "d", "no alive peer to ask for left")) -- the retries are unchanged
     assert.is_nil(sim:owner("laptop"))
@@ -1998,7 +2001,7 @@ describe("claim with the display absent and nobody reachable", function()
     end
     assert.equal(0, sim:notified("claim-failed"))
     assert.same({}, lines(sim, "laptop", "e"))
-    assert.equal(3, #logged(sim, "laptop", "i", "not connected here and no other node is reachable"))
+    assert.equal(3, #logged(sim, "laptop", "i", "not connected here and no other node that can switch it"))
   end)
 
   it("Q2 a peer that is alive but cannot help still makes it an error with a notification", function()
@@ -2023,6 +2026,224 @@ describe("claim with the display absent and nobody reachable", function()
     assert.equal(0, sim:notified("claim-failed"))
     assert.same({}, logged(sim, "laptop", "i", "not connected here"))
     assert.same({}, sim:node("laptop").intents)
+  end)
+
+  -- 0.2.3: a peer that is alive but outside `control` (no DDC) cannot switch the display either, so its being
+  -- on the network does not turn the claim of a laptop without the monitor into an error.
+  it("Q4 a laptop without the monitor and only a peer without DDC alive ends quietly too", function()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" }, autoSwitch = false,
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:unplug("laptop")
+    sim:advance(3)
+    sim:activate("laptop")
+    sim:advance(30)
+    assert.is_true(sim:node("laptop"):alive("desk-mini"))
+    assert.same({}, logged(sim, "laptop", "e", "cannot claim"))
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.equal(1, #logged(sim, "laptop", "i",
+      "left is not connected here and no other node that can switch it is reachable; not claiming"))
+    assert.equal(5, #logged(sim, "laptop", "d", "no alive peer to ask for left")) -- the retries are unchanged
+    assert.equal(0, sim:notified("display-lost")) -- the laptop never owned the display
+  end)
+end)
+
+-- 0.2.3. With the monitor's automatic input switching off (recommended), a cable pulled while its node owns
+-- the display leaves the monitor on that input with no picture, and only the monitor's buttons bring it back.
+-- The recovery rules R3a / R3b write the new owner without any DDC and mark that record `assumed`.
+-- (A) The controller that lost the display says so in a notification right away.
+-- (B) The home node without DDC says so once per such record, when its claim could not get the display switched.
+describe("monitor left on a lost input", function()
+  local function makeOff()
+    local sim = Sim.new({
+      nodes = { "desk-mini", "laptop" },
+      home = "desk-mini",
+      whenAway = { ["desk-mini"] = "mirror" },
+      monitor = {
+        inputs = { ["desk-mini"] = 17, laptop = 21 }, mode = "sticky", acceptsInactive = true,
+        control = { "laptop" }, noDdc = { "desk-mini" }, autoSwitch = false,
+      },
+    })
+    sim:start()
+    sim:advance(1)
+    sim:activate("laptop")
+    sim:advance(1)
+    assert.equal(21, sim:input())
+    return sim
+  end
+
+  -- The case behind this: the cable is pulled from the unlocked laptop, which stays on the network (Wi-Fi).
+  local function pulled()
+    local sim = makeOff()
+    sim:unplug("laptop")
+    sim:advance(3)
+    return sim
+  end
+
+  local function assumedEverywhere(sim, expected)
+    for _, n in ipairs({ "desk-mini", "laptop" }) do
+      assert.equal(expected, sim:state(n):assumed("left"), "assumed as seen by " .. n)
+    end
+  end
+
+  it("A1 the controller notifies once when R3a takes the display it showed away", function()
+    local sim = pulled()
+    assert.equal(21, sim:input()) -- no auto-switch: still on the laptop's input
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assumedEverywhere(sim, true)
+    assert.equal(1, sim:notified("display-lost", "laptop"))
+    assert.equal(0, sim:notified("display-lost", "desk-mini"))
+    assert.equal(1, #logged(sim, "laptop", "i", "left disappeared, assuming it switched to desk-mini"))
+    assert.equal(1, #logged(sim, "laptop", "w", "monitor's buttons"))
+    sim:advance(120) -- the heartbeat backup does not repeat it
+    assert.equal(1, sim:notified("display-lost"))
+  end)
+
+  it("A2 a cable pulled after a lock (release done) raises nothing", function()
+    local sim = makeOff()
+    sim:lock("laptop")
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    sim:unplug("laptop")
+    sim:advance(60)
+    assert.equal(0, sim:notified("display-lost"))
+    assumedEverywhere(sim, false)
+  end)
+
+  it("B1 the home node notifies once when its claim ends on an assumed record (the incident)", function()
+    local sim = pulled()
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(21, sim:input()) -- nobody could switch it
+    assert.equal(1, sim:notified("switch-by-hand", "desk-mini"))
+    assert.equal(0, sim:notified("claim-failed"))
+    assert.same({}, logged(sim, "desk-mini", "e", "cannot claim"))
+    assert.equal(1, #logged(sim, "desk-mini", "i", "no controller reachable for left"))
+    assert.equal(1, #logged(sim, "desk-mini", "w", "monitor's buttons"))
+    assert.equal(0, sim:ddcCalls("desk-mini"))
+  end)
+
+  it("B2 only once per record, not on every unlock (also after the rate limit has passed)", function()
+    local sim = pulled()
+    for _ = 1, 3 do
+      sim:activate("desk-mini")
+      sim:advance(30)
+      sim:lock("desk-mini")
+      sim:advance(400)
+    end
+    assert.equal(1, sim:notified("switch-by-hand"))
+    assert.equal(3, #logged(sim, "desk-mini", "i", "no controller reachable for left"))
+  end)
+
+  it("B3 a confirmed hand-over followed by an unplugged laptop raises nothing on the home node", function()
+    local sim = makeOff()
+    sim:lock("laptop") -- release by DDC: owner desk-mini, confirmed
+    sim:advance(1)
+    sim:unplug("laptop")
+    sim:advance(3)
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(0, sim:notified("switch-by-hand"))
+    assert.equal(1, #logged(sim, "desk-mini", "i", "no controller reachable for left"))
+  end)
+
+  it("B4 a later switch by DDC confirms the record again", function()
+    local sim = pulled()
+    sim:plug("laptop")
+    sim:lock("laptop")
+    sim:advance(1)
+    sim:activate("laptop") -- pull: confirmed laptop
+    sim:advance(1)
+    sim:lock("laptop") -- release: confirmed desk-mini
+    sim:advance(1)
+    assumedEverywhere(sim, false)
+    sim:unplug("laptop")
+    sim:advance(3)
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(0, sim:notified("switch-by-hand"))
+  end)
+
+  it("B5 R3b: the laptop vanishes while it owns the display; the home node notifies on its claim", function()
+    local sim = makeOff()
+    sim:partition("laptop", true)
+    sim:advance(200)
+    assert.equal("desk-mini", sim:owner("desk-mini"))
+    assert.is_true(sim:state("desk-mini"):assumed("left"))
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(1, sim:notified("switch-by-hand", "desk-mini"))
+    assert.equal(0, sim:notified("claim-failed"))
+  end)
+
+  it("B7 an assumed record is not trusted before the last attempt: a controller back in time switches it", function()
+    local sim = makeOff()
+    sim:partition("laptop", true)
+    sim:advance(200) -- R3b on desk-mini
+    assert.is_true(sim:state("desk-mini"):assumed("left"))
+    sim:activate("desk-mini")
+    sim:advance(3) -- the claim waits instead of assuming at once
+    assert.equal(0, sim:notified("switch-by-hand"))
+    assert.same({}, logged(sim, "desk-mini", "i", "no controller reachable"))
+    sim:partition("laptop", false)
+    sim:hello("laptop") -- the laptop is back (e.g. after a reboot) while the claim still waits
+    sim:advance(2)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assumedEverywhere(sim, false)
+    sim:advance(30)
+    assert.equal(0, sim:notified("switch-by-hand"))
+    assert.same({}, sim:node("desk-mini").intents)
+  end)
+
+  it("B8 a release that lands on an assumed record of the same target confirms it", function()
+    local sim = makeOff()
+    sim:partition("laptop", true)
+    sim:advance(200) -- R3b on desk-mini: owner desk-mini, assumed; the laptop still thinks it owns
+    sim:partition("laptop", false)
+    sim:lock("laptop") -- async release to desk-mini, DDC in flight for 0.1 s
+    sim:hello("desk-mini") -- desk-mini's assumed record reaches the laptop before the release lands
+    sim:advance(1)
+    assert.equal(17, sim:input())
+    allOwners(sim, { "desk-mini", "laptop" }, "desk-mini")
+    assumedEverywhere(sim, false)
+  end)
+
+  it("B9 a peer that echoes the record without the flag (0.2.2) does not clear it", function()
+    local sim = pulled()
+    local mini = sim:node("desk-mini")
+    local _, ts = sim:state("desk-mini"):owner("left")
+    mini:onMessage({
+      type = "state", from = "laptop", instance = sim:node("laptop").instance, ts = 0,
+      body = { state = { owner = { left = { node = "desk-mini", ts = ts } } } },
+    })
+    sim:advance(60) -- heartbeats both ways
+    assumedEverywhere(sim, true)
+    sim:activate("desk-mini")
+    sim:advance(30)
+    assert.equal(1, sim:notified("switch-by-hand", "desk-mini"))
+  end)
+
+  it("B10 the claim hotkey / claim() on the home node warns the same way", function()
+    local sim = pulled()
+    assert.is_true(sim:node("desk-mini"):claim())
+    sim:advance(30)
+    assert.equal(1, sim:notified("switch-by-hand", "desk-mini"))
+    assert.equal(0, sim:notified("claim-failed"))
+  end)
+
+  it("B6 status() shows whether the owner record is only assumed", function()
+    local sim = pulled()
+    assert.is_true(sim:node("desk-mini"):status().displays.left.assumed)
+    local fresh = makeOff()
+    assert.is_false(fresh:node("desk-mini"):status().displays.left.assumed)
   end)
 end)
 

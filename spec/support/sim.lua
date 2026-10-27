@@ -11,7 +11,9 @@
 --                 input = start input (default: the home node's input),
 --                 control = list of nodes allowed to run DDC (default: every node in inputs, sorted),
 --                 noDdc = list of nodes whose backend reports success but never changes the monitor
---                 (fact F1: Mac mini HDMI); their backend calls are counted by sim:ddcCalls(name)}
+--                 (fact F1: Mac mini HDMI); their backend calls are counted by sim:ddcCalls(name),
+--                 autoSwitch = false: the monitor's automatic input switching is off, so a pulled cable leaves
+--                 it on that input (default true: it falls back to the home input, F7)}
 --   home, pull   display settings (pull defaults to true), displayId (default "left")
 --   heartbeat    seconds (default 30)         latency  network one-way delay in seconds (default 0.01)
 --   partitionMode "unreachable" (default): a send involving a partitioned node fails at once with
@@ -75,6 +77,7 @@ local function newMonitor(spec)
     mode = spec.mode or "detaching",
     acceptsInactive = spec.acceptsInactive == true,
     input = spec.input,
+    autoSwitch = spec.autoSwitch ~= false,
     commands = 0,
     applied = 0,
     stuck = false,
@@ -422,6 +425,7 @@ function Sim.new(opts)
     mode = opts.monitor.mode,
     acceptsInactive = opts.monitor.acceptsInactive,
     input = opts.monitor.input or opts.monitor.inputs[opts.home],
+    autoSwitch = opts.monitor.autoSwitch,
   })
   self.partitioned, self.sensors, self.counts, self.entries, self.routes = {}, {}, {}, {}, {}
   self.retired, self.messages, self.notifications, self.logLines = {}, {}, {}, {}
@@ -498,11 +502,12 @@ function Sim:lid(name, closed)
 end
 
 -- The cable between `name` and the monitor is pulled (F7): the monitor is no longer visible to `name`, and
--- if it was showing `name`'s input it falls back to the home input (Auto-Switch Input). The node's screen
--- watcher fires afterwards unless opts.silent (to exercise the heartbeat backup). sim:plug reverses it.
+-- if it was showing `name`'s input it falls back to the home input (Auto-Switch Input; with monitor
+-- autoSwitch = false it stays on that input). The node's screen watcher fires afterwards unless opts.silent
+-- (to exercise the heartbeat backup). sim:plug reverses it.
 function Sim:unplug(name, opts)
   self.unplugged[name] = true
-  if self.monitor.input == self.monitor.inputs[name] then
+  if self.monitor.autoSwitch and self.monitor.input == self.monitor.inputs[name] then
     self.monitor.input = self.monitor.inputs[self.home]
   end
   if not (opts and opts.silent) then self.entries[name].screenWatcher.fire() end

@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- DisplayKVM tells you when the monitor's buttons are needed. With the monitor's automatic input switching off
+  (recommended), a cable pulled while its Mac owns the display, without a lock first, leaves the monitor on that input
+  with no picture. The Mac that lost the display now logs a warning and notifies "<display> was disconnected while it
+  showed this Mac. If the monitor has no picture, switch its input with the monitor's buttons." The home Mac without
+  DDC, when its claim (unlock, wake, the hotkey or `claim()`) ends without any Mac in `control` able to switch the
+  monitor to it, warns and notifies "Cannot switch <display> to this Mac. ..." once per such event; the usual case
+  (the controller released the display and is now locked or unplugged) stays silent.
+- Owner records written by the repairs without DDC (a controller lost the display, every controller is gone) carry
+  `assumed = true` in the replicated state until a real switch replaces them; `status()` shows it as
+  `displays[id].assumed`. A 0.2.2 peer ignores the field and cannot clear it by sending the record back, but it never
+  sets it either: update every Mac.
+
+### Changed
+
+- A claim of a Mac without DDC no longer accepts an `assumed` record naming itself before its last attempt: a Mac in
+  `control` that comes back during the retries (for example after a reboot) is asked to switch the monitor.
+- A release that lands while the state already names its target through an `assumed` record now writes a confirmed
+  record.
+- A claim whose display is not connected to this Mac now also ends quietly (one info line, no error, no notification)
+  when other Macs are alive but none of them can switch the display (none in `control`), for example a laptop at home
+  with its cable out while only the home Mac without DDC is on the network. The line now reads "<display> is not
+  connected here and no other node that can switch it is reachable; not claiming".
+
 ## [0.2.2]
 
 Housekeeping: switching behaves exactly as in 0.2.1; only logs, notifications and docs change.

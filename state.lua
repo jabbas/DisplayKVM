@@ -8,10 +8,13 @@ function State.new()
   return setmetatable({ _owner = {}, _presence = {} }, State)
 end
 
--- True when owner record `a` beats record `b`: higher ts wins, equal ts -> greater node name.
+-- True when owner record `a` beats record `b`: higher ts wins, equal ts -> greater node name. On a full tie
+-- (same ts and node) a record marked `assumed` beats an unmarked one, so a peer that does not know the flag
+-- (0.2.2) and sends the record back without it cannot turn it into a confirmed one; the order stays total.
 function State.ownerWins(a, b)
   if a.ts ~= b.ts then return a.ts > b.ts end
-  return a.node > b.node
+  if a.node ~= b.node then return a.node > b.node end
+  return a.assumed == true and b.assumed ~= true
 end
 
 local function validOwner(r)
@@ -29,9 +32,11 @@ local function asMap(t)
   return t
 end
 
-function State:setOwner(display, node, ts)
+-- `assumed` (optional): the record was written by a recovery rule without any DDC (R3a, R3b), so nothing
+-- confirms that the monitor really shows `node`. Any other write leaves it unset.
+function State:setOwner(display, node, ts, assumed)
   local cur = self._owner[display]
-  local new = { node = node, ts = ts }
+  local new = { node = node, ts = ts, assumed = assumed == true or nil }
   if cur and not State.ownerWins(new, cur) then return false end
   self._owner[display] = new
   return true
@@ -50,6 +55,12 @@ function State:owner(display)
   return r.node, r.ts
 end
 
+-- Whether the current owner record of `display` is only assumed (see setOwner). False when there is none.
+function State:assumed(display)
+  local r = self._owner[display]
+  return r ~= nil and r.assumed == true
+end
+
 function State:presence(node)
   local r = self._presence[node]
   if not r then return nil end
@@ -60,7 +71,7 @@ function State:merge(snapshot)
   local changes = {}
   snapshot = asMap(snapshot)
   for display, r in pairs(asMap(snapshot.owner)) do
-    if type(display) == "string" and validOwner(r) and self:setOwner(display, r.node, r.ts) then
+    if type(display) == "string" and validOwner(r) and self:setOwner(display, r.node, r.ts, r.assumed == true) then
       changes[#changes + 1] = { kind = "owner", key = display }
     end
   end
@@ -75,7 +86,7 @@ end
 function State:snapshot()
   local snap = { owner = {}, presence = {} }
   for display, r in pairs(self._owner) do
-    snap.owner[display] = { node = r.node, ts = r.ts }
+    snap.owner[display] = { node = r.node, ts = r.ts, assumed = r.assumed }
   end
   for node, r in pairs(self._presence) do
     snap.presence[node] = { active = r.active, since = r.since, ts = r.ts }

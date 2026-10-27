@@ -229,7 +229,9 @@ monitor makes its own decisions that DisplayKVM does not see: it can jump to ano
 blanks its display, and it can bounce back to the previous input when the DDC switch arrives before the new Mac's
 video output is up. The trade-off: if a Mac's cable is unplugged while it owns the display (without locking it
 first), the monitor stays on that input with no signal until you switch it with the monitor's buttons. DisplayKVM's
-state still recovers by itself (the two repairs above).
+state still recovers by itself (the two repairs above), and it tells you when the buttons are needed: the Mac whose
+cable was pulled shows a notification right away, and the home Mac shows one (once) when it becomes active (or you
+press the claim hotkey) and no Mac in `control` can switch the monitor to it within the usual retries (about 22 s).
 
 Update every Mac to the same release together: a node from 0.1.x does not know `control` and may still send its DDC
 commands or `request`s to a node that cannot handle them. Such a `request` is answered with `not-capable`.
@@ -257,7 +259,8 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
   switching off (see [Monitors that a Mac cannot control](#monitors-that-a-mac-cannot-control)).
 - With the monitor's automatic input switching off, unplugging the cable of the Mac that owns the display (without
   locking it first) leaves the monitor on that input with no signal until you switch it with the monitor's buttons.
-  DisplayKVM's state recovers by itself.
+  DisplayKVM's state recovers by itself and notifies you (see "... switch its input with the monitor's buttons" under
+  [Troubleshooting](#troubleshooting)).
 - A controller that hangs with the cable still plugged in leaves the monitor on that input, asleep: there is no
   automatic switch. After a minute or two the home node corrects the state and removes its mirror, but the picture
   only comes back when you switch the input with the monitor's buttons.
@@ -285,10 +288,12 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
     message from that Mac, or `nil` if there was none yet; `active` is that Mac's replicated presence (`false` when
     it is inactive, `nil` when nothing is known about it); `alive` is true if it was heard from within the last
     3 heartbeat intervals.
-  - `displays[id] = { owner, visible, input, control, mirrored }`: `owner` is the Mac the state says has the display
-    (`nil` if unknown); `visible` is whether *this* Mac currently sees the monitor (it is false on a Mac that is
-    currently mirroring the display); `input` is this Mac's DDC input for it; `control` lists the nodes that can
-    switch it over DDC; `mirrored` is whether this Mac currently mirrors it.
+  - `displays[id] = { owner, visible, input, control, mirrored, assumed }`: `owner` is the Mac the state says has
+    the display (`nil` if unknown); `visible` is whether *this* Mac currently sees the monitor (it is false on a Mac
+    that is currently mirroring the display); `input` is this Mac's DDC input for it; `control` lists the nodes that
+    can switch it over DDC; `mirrored` is whether this Mac currently mirrors it; `assumed` is true when `owner` was
+    written by one of the repairs without DDC (a pulled cable, a vanished controller) and no switch has confirmed it
+    since.
 - **Logs:** the logger is named `DisplayKVM`. Raise detail with `logLevel = "debug"` in `configure`.
 - **The monitor flips back or jumps to another Mac by itself:** disable the monitor's automatic input switching in its
   OSD menu, in every setup (see [Monitors that a Mac cannot control](#monitors-that-a-mac-cannot-control)).
@@ -298,8 +303,17 @@ The full design, protocol and edge cases are in [docs/design.md](https://github.
   or `left switched to laptop via laptop (release: ...)` (a release handed to a node in `control`). A logged
   switch only means the backend reported success; on some ports and monitors that is not proof (see
   [Limitations](#limitations)).
-- **"... is not connected here and no other node is reachable; not claiming":** the claim on unlock found neither
-  the monitor nor another Mac (for example a laptop away from home). It is not an error and raises no notification.
+- **"... is not connected here and no other node that can switch it is reachable; not claiming":** the claim on
+  unlock found neither the monitor nor another Mac in the display's `control` (for example a laptop away from home,
+  or at home with its cable out while only Macs without DDC are around). It is not an error and raises no
+  notification.
+- **"... was disconnected while it showed this Mac" / "Cannot switch ... to this Mac" notification, "... switch its
+  input with the monitor's buttons":** a cable was pulled (or a Mac in `control` vanished) while that Mac owned the
+  display, so nobody sent the switch. With the monitor's automatic input switching off it stays on that input with no
+  picture: switch it with the monitor's buttons. The first notification comes from the Mac that lost the display, the
+  second one (once per such event) from the home Mac when it becomes active (or you press the claim hotkey) and no Mac
+  in `control` can switch the monitor to it. Locking the Mac before unplugging its cable avoids both. Switching the
+  monitor off with its power button while a Mac in `control` shows it looks the same and gives the first one.
 - **Clamshell mode** (laptop closed with an external display): set `activity.lid = false`, otherwise closing the
   lid releases the displays.
 - **The monitor ignores a claim** while showing another input: set `pull = false` on that display.
