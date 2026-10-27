@@ -1,0 +1,10 @@
+[
+  {
+    "name": "DisplayKVM",
+    "version": "0.2.3",
+    "desc": "Shares one or more monitors between several Macs without a hardware KVM switch.",
+    "author": "Grzegorz Dzięgielewski <jabbas@jabbas.eu>",
+    "license": "MIT - https://opensource.org/licenses/MIT",
+    "homepage": "https://github.com/jabbas/DisplayKVM"
+  }
+]
